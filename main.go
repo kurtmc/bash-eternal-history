@@ -121,7 +121,7 @@ func main() {
 			panic(err)
 		}
 		log.Println("error:", notFoundException)
-	} else {
+	} else if err != nil {
 		panic(err)
 	}
 
