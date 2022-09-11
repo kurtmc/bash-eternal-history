@@ -187,17 +187,23 @@ func NewFile(tableName string) *File {
 func (f *File) getContent(ctx context.Context) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := svc.Scan(ctx, &dynamodb.ScanInput{
+
+	paginator := dynamodb.NewScanPaginator(svc, &dynamodb.ScanInput{
 		TableName: &f.DynamodbTableName,
 	})
-	if err != nil {
-		log.Printf("could not read content: %v", err)
-		return f.ContentCache, nil
+
+	var items []map[string]types.AttributeValue
+	for paginator.HasMorePages() {
+		output, err := paginator.NextPage(ctx)
+		if err != nil {
+			log.Printf("could not read content: %v", err)
+			return f.ContentCache, nil
+		}
+		items = append(items, output.Items...)
 	}
 
-	log.Printf("count: %v", out.Count)
 	var lines []string
-	for _, item := range out.Items {
+	for _, item := range items {
 		line := item["content"].(*types.AttributeValueMemberS).Value
 		lines = append(lines, line)
 	}
