@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -202,14 +203,14 @@ func (f *File) getContent(ctx context.Context) (string, error) {
 		items = append(items, output.Items...)
 	}
 
+	sort.Slice(items, func(i, j int) bool {
+		return items[i]["timestamp"].(*types.AttributeValueMemberN).Value < items[j]["timestamp"].(*types.AttributeValueMemberN).Value
+	})
+
 	var lines []string
 	for _, item := range items {
 		line := item["content"].(*types.AttributeValueMemberS).Value
 		lines = append(lines, line)
-	}
-
-	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
-		lines[i], lines[j] = lines[j], lines[i]
 	}
 
 	content := strings.Join(lines, "\n") + "\n"
