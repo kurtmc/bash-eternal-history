@@ -130,6 +130,7 @@ func main() {
 		mountpoint,
 		fuse.FSName("basheternalhistory"),
 		fuse.Subtype("basheternalhistoryfs"),
+		fuse.AllowNonEmptyMount(),
 	)
 	if err != nil {
 		log.Fatal(err)
