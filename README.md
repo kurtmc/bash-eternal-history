@@ -21,6 +21,7 @@ Environment=AWS_SECRET_ACCESS_KEY=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 Environment=AWS_REGION=ap-southeast-2
 ExecStartPre=/usr/bin/mkdir -p %h/.bash-eternal-history-fuse
 ExecStart=/opt/bash-eternal-history/bash-eternal-history %h/.bash-eternal-history-fuse
+ExecStop=/usr/bin/umount %h/.bash-eternal-history-fuse
 
 [Install]
 WantedBy=default.target
