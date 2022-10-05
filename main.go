@@ -7,9 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sort"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -40,6 +38,8 @@ var ch chan AppendHistoryMessage
 
 var dynmodbTableName string = "bash-eternal-history"
 
+var content *ContentRepository = nil
+
 func init() {
 	ctx := context.Background()
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRetryer(func() aws.Retryer {
@@ -51,6 +51,8 @@ func init() {
 	svc = dynamodb.NewFromConfig(cfg)
 
 	ch = make(chan AppendHistoryMessage, 100)
+
+	content = NewContentRepository(svc, dynmodbTableName)
 
 	go func() {
 		ctx := context.TODO()
@@ -180,59 +182,22 @@ type File struct {
 	ContentCache      string
 }
 
+type ContentCache struct {
+	Content     string
+	LastUpdated time.Time
+}
+
 func NewFile(tableName string) *File {
 	return &File{
 		DynamodbTableName: tableName,
 	}
 }
 
-func (f *File) getContent(ctx context.Context) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	paginator := dynamodb.NewScanPaginator(svc, &dynamodb.ScanInput{
-		TableName: &f.DynamodbTableName,
-	})
-
-	var items []map[string]types.AttributeValue
-	for paginator.HasMorePages() {
-		output, err := paginator.NextPage(ctx)
-		if err != nil {
-			log.Printf("could not read content: %v", err)
-			return f.ContentCache, nil
-		}
-		items = append(items, output.Items...)
-	}
-
-	sort.Slice(items, func(i, j int) bool {
-		return items[i]["timestamp"].(*types.AttributeValueMemberN).Value < items[j]["timestamp"].(*types.AttributeValueMemberN).Value
-	})
-
-	var lines []string
-	for _, item := range items {
-		line := item["content"].(*types.AttributeValueMemberS).Value
-		lines = append(lines, line)
-	}
-
-	content := strings.Join(lines, "\n") + "\n"
-
-	// The initial cache should be stored on the machine as a file, that
-	// way when you boot up and have no history, this file can be used.
-	f.ContentCache = content
-
-	return content, nil
-}
-
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Inode = 2
 	a.Mode = 0o444
 
-	content, err := f.getContent(ctx)
-	if err != nil {
-		return err
-	}
-
-	a.Size = uint64(len(content))
+	a.Size = uint64(len(content.Get(ctx)))
 
 	// TODO: I don't know how to set this correctly
 	a.Uid = 1000
@@ -242,11 +207,7 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	content, err := f.getContent(ctx)
-	if err != nil {
-		return err
-	}
-	fuseutil.HandleRead(req, resp, []byte(content))
+	fuseutil.HandleRead(req, resp, []byte(content.Get(ctx)))
 	return nil
 }
 
