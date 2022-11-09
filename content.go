@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -11,10 +12,9 @@ import (
 )
 
 type ContentRepository struct {
-	Content     string
-	svc         *dynamodb.Client
-	tableName   string
-	lastUpdated time.Time
+	Content   string
+	svc       *dynamodb.Client
+	tableName string
 }
 
 func NewContentRepository(svc *dynamodb.Client, tableName string) *ContentRepository {
@@ -56,19 +56,10 @@ func (c *ContentRepository) readContent(ctx context.Context) (string, error) {
 	return content, nil
 }
 
-func (c *ContentRepository) Get(ctx context.Context) string {
-	if time.Since(c.lastUpdated) < (100 * time.Millisecond) {
-		return c.Content
-	}
-
+func (c *ContentRepository) Get(ctx context.Context) (string, error) {
 	content, err := c.readContent(ctx)
 	if err != nil {
-		// TODO: store a copy of content on disk, so that when
-		// an error occurs we can load the last valid value of
-		// content
-		return c.Content
+		return "", fmt.Errorf("could not retrive data from dyanmodb: %v", err)
 	}
-	c.lastUpdated = time.Now()
-	c.Content = content
-	return content
+	return content, nil
 }

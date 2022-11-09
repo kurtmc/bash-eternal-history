@@ -40,6 +40,9 @@ var dynmodbTableName string = "bash-eternal-history"
 
 var content *ContentRepository = nil
 
+var existingDataLoaded bool = false
+var data []byte = make([]byte, 0)
+
 func init() {
 	ctx := context.Background()
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRetryer(func() aws.Retryer {
@@ -194,10 +197,21 @@ func NewFile(tableName string) *File {
 }
 
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
+	if !existingDataLoaded {
+		log.Printf("DEBUG: loading existing data")
+		c, err := content.Get(ctx)
+		if err != nil {
+			log.Printf("DEBUG: WARN: could not get content: %v", err)
+		} else {
+			existingDataLoaded = true
+		}
+		data = []byte(c)
+	}
+
 	a.Inode = 2
 	a.Mode = 0o444
 
-	a.Size = uint64(len(content.Get(ctx)))
+	a.Size = uint64(len(data))
 
 	// TODO: I don't know how to set this correctly
 	a.Uid = 1000
@@ -207,15 +221,49 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	fuseutil.HandleRead(req, resp, []byte(content.Get(ctx)))
+	log.Printf("DEBUG: Read()")
+	if !existingDataLoaded {
+		log.Printf("DEBUG: loading existing data")
+		c, err := content.Get(ctx)
+		if err != nil {
+			log.Printf("DEBUG: WARN: could not get content: %v", err)
+		} else {
+			existingDataLoaded = true
+		}
+		data = []byte(c)
+	}
+
+	fuseutil.HandleRead(req, resp, data)
+
 	return nil
 }
 
+func HandleWrite(req *fuse.WriteRequest, resp *fuse.WriteResponse, data *[]byte) {
+	size := len(req.Data)
+
+	if int(req.Offset)+size > int(len(*data)) {
+		newData := make([]byte, int(req.Offset)+size)
+		copy(newData, *data)
+		*data = newData
+	}
+	n := copy((*data)[req.Offset:int(req.Offset)+size], req.Data)
+	resp.Size = n
+}
+
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
+	defer duration(track("Write()"))
 	ch <- AppendHistoryMessage{
 		Timestamp: int(time.Now().UnixNano()),
 		Content:   string(req.Data),
 	}
-	resp.Size = len(req.Data)
+	HandleWrite(req, resp, &data)
 	return nil
+}
+
+func track(msg string) (string, time.Time) {
+	return msg, time.Now()
+}
+
+func duration(msg string, start time.Time) {
+	log.Printf("DEBUG: %v: %v\n", msg, time.Since(start))
 }
