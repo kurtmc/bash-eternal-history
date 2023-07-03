@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/kelseyhightower/envconfig"
 )
 
 func usage() {
@@ -43,7 +44,17 @@ var content *ContentRepository = nil
 var existingDataLoaded bool = false
 var data []byte = make([]byte, 0)
 
+type Config struct {
+	ReadContentTimeout time.Duration `envconfig:"READ_CONTENT_TIMEOUT" default:"15s"`
+}
+
+var appConig Config = Config{}
+
 func init() {
+	err := envconfig.Process("", &appConig)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
 	ctx := context.Background()
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRetryer(func() aws.Retryer {
 		return aws.NopRetryer{}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -25,7 +24,7 @@ func NewContentRepository(svc *dynamodb.Client, tableName string) *ContentReposi
 }
 
 func (c *ContentRepository) readContent(ctx context.Context) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, appConig.ReadContentTimeout)
 	defer cancel()
 
 	paginator := dynamodb.NewScanPaginator(c.svc, &dynamodb.ScanInput{
