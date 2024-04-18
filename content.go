@@ -12,11 +12,11 @@ import (
 
 type ContentRepository struct {
 	Content   string
-	svc       *dynamodb.Client
+	svc       dynamodb.ScanAPIClient
 	tableName string
 }
 
-func NewContentRepository(svc *dynamodb.Client, tableName string) *ContentRepository {
+func NewContentRepository(svc dynamodb.ScanAPIClient, tableName string) *ContentRepository {
 	return &ContentRepository{
 		svc:       svc,
 		tableName: tableName,
