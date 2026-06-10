@@ -7,14 +7,11 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
 	"syscall"
 	"time"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
-	_ "bazil.org/fuse/fs/fstestutil"
-	"bazil.org/fuse/fuseutil"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -28,69 +25,10 @@ func usage() {
 	flag.PrintDefaults()
 }
 
-var svc *dynamodb.Client
-
-type AppendHistoryMessage struct {
-	Content   string
-	Timestamp int
-}
-
-var ch chan AppendHistoryMessage
-
-var dynmodbTableName string = "bash-eternal-history"
-
-var content *ContentRepository = nil
-
-var existingDataLoaded bool = false
-var data []byte = make([]byte, 0)
-
 type Config struct {
 	ReadContentTimeout time.Duration `envconfig:"READ_CONTENT_TIMEOUT" default:"15s"`
-}
-
-var appConig Config = Config{}
-
-func init() {
-	err := envconfig.Process("", &appConig)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-	ctx := context.Background()
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRetryer(func() aws.Retryer {
-		return aws.NopRetryer{}
-	}))
-	if err != nil {
-		log.Fatalf("unable to load SDK config, %v", err)
-	}
-	svc = dynamodb.NewFromConfig(cfg)
-
-	ch = make(chan AppendHistoryMessage, 100)
-
-	content = NewContentRepository(svc, dynmodbTableName)
-
-	go func() {
-		ctx := context.TODO()
-		for {
-			m := <-ch
-			for {
-				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				defer cancel()
-				_, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
-					TableName: &dynmodbTableName,
-					Item: map[string]types.AttributeValue{
-						"timestamp":   &types.AttributeValueMemberN{Value: strconv.Itoa(m.Timestamp)},
-						"timestamp_2": &types.AttributeValueMemberN{Value: strconv.Itoa(m.Timestamp)},
-						"content":     &types.AttributeValueMemberS{Value: m.Content},
-					},
-				})
-				if err == nil {
-					break
-				}
-				log.Printf("unable to write to dynamodb, trying again: %v", err)
-				time.Sleep(5 * time.Second)
-			}
-		}
-	}()
+	TableName          string        `envconfig:"DYNAMODB_TABLE_NAME" default:"bash-eternal-history"`
+	ContentCacheTTL    time.Duration `envconfig:"CONTENT_CACHE_TTL" default:"5m"`
 }
 
 func main() {
@@ -103,44 +41,27 @@ func main() {
 	}
 	mountpoint := flag.Arg(0)
 
-	// create table if it does not exist
-	_, err := svc.DescribeTable(context.TODO(), &dynamodb.DescribeTableInput{
-		TableName: &dynmodbTableName,
-	})
-	var notFoundException *types.ResourceNotFoundException
-	if errors.As(err, &notFoundException) {
-		input := &dynamodb.CreateTableInput{
-			TableName: &dynmodbTableName,
-			AttributeDefinitions: []types.AttributeDefinition{
-				{
-					AttributeName: aws.String("timestamp"),
-					AttributeType: types.ScalarAttributeTypeN,
-				},
-				{
-					AttributeName: aws.String("timestamp_2"),
-					AttributeType: types.ScalarAttributeTypeN,
-				},
-			},
-			KeySchema: []types.KeySchemaElement{
-				{
-					AttributeName: aws.String("timestamp"),
-					KeyType:       types.KeyTypeHash,
-				},
-				{
-					AttributeName: aws.String("timestamp_2"),
-					KeyType:       types.KeyTypeRange,
-				},
-			},
-			BillingMode: types.BillingModePayPerRequest,
-		}
-		_, err := svc.CreateTable(context.TODO(), input)
-		if err != nil {
-			panic(err)
-		}
-		log.Println("error:", notFoundException)
-	} else if err != nil {
-		panic(err)
+	var appConfig Config
+	if err := envconfig.Process("", &appConfig); err != nil {
+		log.Fatal(err)
 	}
+
+	ctx := context.Background()
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		log.Fatalf("unable to load SDK config, %v", err)
+	}
+	svc := dynamodb.NewFromConfig(cfg)
+
+	if err := ensureTable(ctx, svc, appConfig.TableName); err != nil {
+		log.Fatalf("unable to ensure dynamodb table exists: %v", err)
+	}
+
+	writer := NewHistoryWriter(svc, appConfig.TableName)
+	go writer.Run()
+
+	repo := NewContentRepository(svc, appConfig.TableName, appConfig.ReadContentTimeout)
+	file := NewFile(repo, writer, appConfig.ContentCacheTTL)
 
 	c, err := fuse.Mount(
 		mountpoint,
@@ -153,21 +74,89 @@ func main() {
 	}
 	defer c.Close()
 
-	err = fs.Serve(c, FS{})
+	err = fs.Serve(c, FS{file: file})
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-// FS implements the hello world file system.
-type FS struct{}
+// TableClient is the subset of the DynamoDB API needed to ensure the history
+// table exists.
+type TableClient interface {
+	dynamodb.DescribeTableAPIClient
+	CreateTable(ctx context.Context, params *dynamodb.CreateTableInput, optFns ...func(*dynamodb.Options)) (*dynamodb.CreateTableOutput, error)
+}
 
-func (FS) Root() (fs.Node, error) {
-	return Dir{}, nil
+// ensureTable creates the history table if it does not exist and waits until
+// it is active, so the first scan does not hit a table that is still being
+// created.
+func ensureTable(ctx context.Context, client TableClient, tableName string, waiterOpts ...func(*dynamodb.TableExistsWaiterOptions)) error {
+	_, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+		TableName: aws.String(tableName),
+	})
+	if err == nil {
+		return nil
+	}
+	var notFound *types.ResourceNotFoundException
+	if !errors.As(err, &notFound) {
+		return err
+	}
+
+	log.Printf("table %q not found, creating it", tableName)
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(tableName),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{
+				AttributeName: aws.String("timestamp"),
+				AttributeType: types.ScalarAttributeTypeN,
+			},
+			{
+				AttributeName: aws.String("timestamp_2"),
+				AttributeType: types.ScalarAttributeTypeN,
+			},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{
+				AttributeName: aws.String("timestamp"),
+				KeyType:       types.KeyTypeHash,
+			},
+			{
+				AttributeName: aws.String("timestamp_2"),
+				KeyType:       types.KeyTypeRange,
+			},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		// Another machine may have created the table between our describe
+		// and create; that is fine, we still wait for it to become active.
+		var inUse *types.ResourceInUseException
+		if !errors.As(err, &inUse) {
+			return err
+		}
+	}
+
+	waiter := dynamodb.NewTableExistsWaiter(client, waiterOpts...)
+	if err := waiter.Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(tableName)}, 2*time.Minute); err != nil {
+		return fmt.Errorf("waiting for table %q to become active: %w", tableName, err)
+	}
+	log.Printf("table %q is active", tableName)
+	return nil
+}
+
+// FS implements the bash eternal history file system.
+type FS struct {
+	file *File
+}
+
+func (f FS) Root() (fs.Node, error) {
+	return Dir{file: f.file}, nil
 }
 
 // Dir implements both Node and Handle for the root directory.
-type Dir struct{}
+type Dir struct {
+	file *File
+}
 
 func (Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Inode = 1
@@ -175,9 +164,9 @@ func (Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
-func (Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
+func (d Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	if name == ".bash_eternal_history" {
-		return NewFile("bash-eternal-history"), nil
+		return d.file, nil
 	}
 	return nil, syscall.ENOENT
 }
@@ -188,93 +177,4 @@ var dirDirs = []fuse.Dirent{
 
 func (Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	return dirDirs, nil
-}
-
-// File implements both Node and Handle for the hello file.
-type File struct {
-	DynamodbTableName string
-	ContentCache      string
-}
-
-type ContentCache struct {
-	Content     string
-	LastUpdated time.Time
-}
-
-func NewFile(tableName string) *File {
-	return &File{
-		DynamodbTableName: tableName,
-	}
-}
-
-func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
-	if !existingDataLoaded {
-		log.Printf("DEBUG: loading existing data")
-		c, err := content.Get(ctx)
-		if err != nil {
-			log.Printf("DEBUG: WARN: could not get content: %v", err)
-		} else {
-			existingDataLoaded = true
-		}
-		data = []byte(c)
-	}
-
-	a.Inode = 2
-	a.Mode = 0o444
-
-	a.Size = uint64(len(data))
-
-	// TODO: I don't know how to set this correctly
-	a.Uid = 1000
-	a.Gid = 1000
-
-	return nil
-}
-
-func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	log.Printf("DEBUG: Read()")
-	if !existingDataLoaded {
-		log.Printf("DEBUG: loading existing data")
-		c, err := content.Get(ctx)
-		if err != nil {
-			log.Printf("DEBUG: WARN: could not get content: %v", err)
-		} else {
-			existingDataLoaded = true
-		}
-		data = []byte(c)
-	}
-
-	fuseutil.HandleRead(req, resp, data)
-
-	return nil
-}
-
-func HandleWrite(req *fuse.WriteRequest, resp *fuse.WriteResponse, data *[]byte) {
-	size := len(req.Data)
-
-	if int(req.Offset)+size > int(len(*data)) {
-		newData := make([]byte, int(req.Offset)+size)
-		copy(newData, *data)
-		*data = newData
-	}
-	n := copy((*data)[req.Offset:int(req.Offset)+size], req.Data)
-	resp.Size = n
-}
-
-func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	defer duration(track("Write()"))
-	ch <- AppendHistoryMessage{
-		Timestamp: int(time.Now().UnixNano()),
-		Content:   string(req.Data),
-	}
-	HandleWrite(req, resp, &data)
-	return nil
-}
-
-func track(msg string) (string, time.Time) {
-	return msg, time.Now()
-}
-
-func duration(msg string, start time.Time) {
-	log.Printf("DEBUG: %v: %v\n", msg, time.Since(start))
 }
