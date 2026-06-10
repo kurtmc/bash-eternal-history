@@ -53,9 +53,10 @@ func main() {
 	}
 	svc := dynamodb.NewFromConfig(cfg)
 
-	if err := ensureTable(ctx, svc, appConfig.TableName); err != nil {
-		log.Fatalf("unable to ensure dynamodb table exists: %v", err)
-	}
+	// The table check needs the network; run it in the background so the
+	// filesystem still mounts when the machine is offline. Reads and writes
+	// retry on their own until the table is available.
+	go ensureTableWithRetry(ctx, svc, appConfig.TableName, 30*time.Second)
 
 	writer := NewHistoryWriter(svc, appConfig.TableName)
 	go writer.Run()
@@ -90,6 +91,20 @@ func main() {
 type TableClient interface {
 	dynamodb.DescribeTableAPIClient
 	CreateTable(ctx context.Context, params *dynamodb.CreateTableInput, optFns ...func(*dynamodb.Options)) (*dynamodb.CreateTableOutput, error)
+}
+
+// ensureTableWithRetry keeps trying until the table exists, so a daemon
+// started without connectivity becomes fully functional once the network
+// returns.
+func ensureTableWithRetry(ctx context.Context, client TableClient, tableName string, retryDelay time.Duration, waiterOpts ...func(*dynamodb.TableExistsWaiterOptions)) {
+	for {
+		err := ensureTable(ctx, client, tableName, waiterOpts...)
+		if err == nil {
+			return
+		}
+		log.Printf("WARN: could not ensure dynamodb table exists, retrying: %v", err)
+		time.Sleep(retryDelay)
+	}
 }
 
 // ensureTable creates the history table if it does not exist and waits until

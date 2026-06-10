@@ -11,6 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -120,12 +121,11 @@ func TestWriterRetriesUntilSuccess(t *testing.T) {
 	assert.Equal(t, 3, client.calls())
 }
 
-func TestWriterGivesUpAfterMaxAttempts(t *testing.T) {
-	// The first line always fails; it must be dropped after maxAttempts so
-	// the line behind it still gets written.
-	client := &fakePutClient{errs: []error{
-		errors.New("boom"), errors.New("boom"), errors.New("boom"),
-	}}
+func TestWriterGivesUpAfterRepeatedAPIRejections(t *testing.T) {
+	// The service keeps rejecting the first line; it must be dropped after
+	// maxAttempts rejections so the line behind it still gets written.
+	rejection := &smithy.GenericAPIError{Code: "ValidationException", Message: "boom"}
+	client := &fakePutClient{errs: []error{rejection, rejection, rejection}}
 	w := newTestWriter(client)
 	w.maxAttempts = 3
 	go w.Run()
@@ -138,6 +138,32 @@ func TestWriterGivesUpAfterMaxAttempts(t *testing.T) {
 	require.Equal(t, 4, client.calls())
 	content := client.input(3).Item["content"].(*types.AttributeValueMemberS).Value
 	assert.Equal(t, "healthy\n", content)
+}
+
+func TestWriterRetriesNetworkErrorsIndefinitely(t *testing.T) {
+	// Network errors do not count towards giving up: a line written while
+	// offline must survive far more attempts than maxAttempts.
+	var errs []error
+	for range 10 {
+		errs = append(errs, errors.New("dial tcp: network is unreachable"))
+	}
+	client := &fakePutClient{errs: errs}
+	w := newTestWriter(client)
+	w.maxAttempts = 3
+	go w.Run()
+	defer close(w.ch)
+
+	assert.True(t, w.Enqueue("echo offline\n"))
+	waitForFlush(t, w)
+
+	require.Equal(t, 11, client.calls())
+	content := client.input(10).Item["content"].(*types.AttributeValueMemberS).Value
+	assert.Equal(t, "echo offline\n", content)
+}
+
+func TestWriterQueueFitsAnOfflineSession(t *testing.T) {
+	w := NewHistoryWriter(&fakePutClient{}, "test")
+	assert.Equal(t, 1000, cap(w.ch))
 }
 
 func TestEnqueueDropsWhenQueueFull(t *testing.T) {

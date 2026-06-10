@@ -107,6 +107,19 @@ func TestEnsureTablePropagatesDescribeError(t *testing.T) {
 	assert.Equal(t, 0, client.createCalls)
 }
 
+func TestEnsureTableWithRetryRecoversFromNetworkErrors(t *testing.T) {
+	// An offline start must not be fatal: the check retries until the
+	// network returns.
+	client := &fakeTableClient{describeErrs: []error{
+		errors.New("dial tcp: network is unreachable"),
+		errors.New("dial tcp: network is unreachable"),
+	}}
+
+	ensureTableWithRetry(context.Background(), client, "history", time.Millisecond, fastWaiter)
+
+	assert.Equal(t, 3, client.describeCalls)
+}
+
 func TestEnsureTablePropagatesCreateError(t *testing.T) {
 	client := &fakeTableClient{
 		describeErrs: []error{&types.ResourceNotFoundException{}},

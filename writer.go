@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math/rand/v2"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go"
 )
 
 // PutItemAPI is the subset of the DynamoDB API used to store history lines.
@@ -39,9 +41,11 @@ type HistoryWriter struct {
 
 func NewHistoryWriter(svc PutItemAPI, tableName string) *HistoryWriter {
 	return &HistoryWriter{
-		svc:         svc,
-		tableName:   tableName,
-		ch:          make(chan AppendHistoryMessage, 100),
+		svc:       svc,
+		tableName: tableName,
+		// Sized so a long offline session's worth of commands fits in the
+		// queue until connectivity returns.
+		ch:          make(chan AppendHistoryMessage, 1000),
 		putTimeout:  5 * time.Second,
 		retryDelay:  5 * time.Second,
 		maxAttempts: 120,
@@ -84,16 +88,23 @@ func (w *HistoryWriter) Run() {
 }
 
 func (w *HistoryWriter) put(m AppendHistoryMessage) {
-	for attempt := 1; ; attempt++ {
+	rejections := 0
+	for {
 		err := w.putOnce(m)
 		if err == nil {
 			return
 		}
-		if attempt >= w.maxAttempts {
-			// Give up rather than let one unwritable line block every
-			// history line behind it forever.
-			log.Printf("ERROR: dropping history line after %d attempts: %v", attempt, err)
-			return
+		// Only responses from the service count towards giving up, so that
+		// a poison line the service keeps rejecting cannot block the queue
+		// forever. Network errors are retried indefinitely: an offline
+		// machine delays history, it must not lose it.
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) {
+			rejections++
+			if rejections >= w.maxAttempts {
+				log.Printf("ERROR: dropping history line after %d rejections: %v", rejections, err)
+				return
+			}
 		}
 		log.Printf("unable to write to dynamodb, trying again: %v", err)
 		time.Sleep(w.retryDelay)
