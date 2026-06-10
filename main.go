@@ -68,6 +68,11 @@ func main() {
 		fuse.FSName("basheternalhistory"),
 		fuse.Subtype("basheternalhistoryfs"),
 		fuse.AllowNonEmptyMount(),
+		// Without a readahead window the kernel reads the file in
+		// synchronous 4KiB requests, which makes bash startup scale with
+		// one FUSE round trip per 4KiB of history.
+		fuse.MaxReadahead(1<<20),
+		fuse.AsyncRead(),
 	)
 	if err != nil {
 		log.Fatal(err)

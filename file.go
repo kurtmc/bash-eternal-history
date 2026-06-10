@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"bazil.org/fuse"
+	"bazil.org/fuse/fs"
 	"bazil.org/fuse/fuseutil"
 )
 
@@ -68,6 +69,15 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Uid = f.uid
 	a.Gid = f.gid
 	return nil
+}
+
+func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+	// Keep the page cache between opens so each new shell does not re-read
+	// the entire history through FUSE; the kernel revalidates with Getattr
+	// when the size changes. The cache may briefly serve a stale view after
+	// a background refresh, which is acceptable for append-mostly history.
+	resp.Flags |= fuse.OpenKeepCache
+	return f, nil
 }
 
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {

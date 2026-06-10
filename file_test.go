@@ -98,6 +98,18 @@ func TestFileLoadsContentOnce(t *testing.T) {
 	assert.Equal(t, 1, repo.callCount())
 }
 
+func TestOpenKeepsPageCache(t *testing.T) {
+	repo := &fakeRepo{content: "abc\n"}
+	f := newTestFile(t, repo)
+
+	resp := &fuse.OpenResponse{}
+	handle, err := f.Open(context.Background(), &fuse.OpenRequest{}, resp)
+
+	require.NoError(t, err)
+	assert.Same(t, f, handle)
+	assert.NotZero(t, resp.Flags&fuse.OpenKeepCache)
+}
+
 func TestFileAttr(t *testing.T) {
 	repo := &fakeRepo{content: "abc\n"}
 	f := newTestFile(t, repo)
