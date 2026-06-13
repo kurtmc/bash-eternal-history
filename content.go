@@ -34,27 +34,35 @@ type historyEntry struct {
 }
 
 func (c *ContentRepository) readContent(ctx context.Context) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.readTimeout)
-	defer cancel()
-
 	paginator := dynamodb.NewScanPaginator(c.svc, &dynamodb.ScanInput{
 		TableName: &c.tableName,
-		// A consistent read makes lines that were just flushed by the
-		// writer visible immediately, so a refresh never serves a view that
-		// is missing this session's history.
+		// A strongly consistent read makes a line that was just flushed by the
+		// writer visible to this scan immediately. Without it an eventually
+		// consistent replica can omit a just-written line, and because the scan
+		// result replaces the in-memory buffer wholesale, that line would
+		// vanish from the local view until a later refresh — hiding a command
+		// the user just ran. The Pending gate guarantees the flush completed,
+		// not that the replica it lands on has caught up.
 		ConsistentRead: aws.Bool(true),
 	})
 
 	var entries []historyEntry
 	for paginator.HasMorePages() {
-		output, err := paginator.NextPage(ctx)
+		// Bound each page rather than the whole scan. A single deadline over
+		// the entire paginated scan would make every load fail outright once
+		// the eternal history grew past what fits in readTimeout; per-page
+		// deadlines let an arbitrarily large table load page by page.
+		pageCtx, cancel := context.WithTimeout(ctx, c.readTimeout)
+		output, err := paginator.NextPage(pageCtx)
+		cancel()
 		if err != nil {
 			return "", err
 		}
 		for _, item := range output.Items {
 			entry, ok := parseItem(item)
 			if !ok {
-				log.Printf("WARN: skipping malformed history item: %v", item)
+				// Avoid logging the raw item: it can contain history content.
+				log.Printf("WARN: skipping malformed history item")
 				continue
 			}
 			if entry.content == "" {

@@ -63,7 +63,7 @@ func TestWriterWritesItem(t *testing.T) {
 	client := &fakePutClient{}
 	w := newTestWriter(client)
 	go w.Run()
-	defer close(w.ch)
+	defer w.Shutdown(context.Background())
 
 	assert.True(t, w.Enqueue("echo hello\n"))
 	waitForFlush(t, w)
@@ -89,7 +89,7 @@ func TestWriterUsesDistinctRangeKeys(t *testing.T) {
 	client := &fakePutClient{}
 	w := newTestWriter(client)
 	go w.Run()
-	defer close(w.ch)
+	defer w.Shutdown(context.Background())
 
 	assert.True(t, w.Enqueue("a\n"))
 	assert.True(t, w.Enqueue("b\n"))
@@ -113,7 +113,7 @@ func TestWriterRetriesUntilSuccess(t *testing.T) {
 	client := &fakePutClient{errs: []error{errors.New("boom"), errors.New("boom")}}
 	w := newTestWriter(client)
 	go w.Run()
-	defer close(w.ch)
+	defer w.Shutdown(context.Background())
 
 	assert.True(t, w.Enqueue("echo hello\n"))
 	waitForFlush(t, w)
@@ -121,15 +121,16 @@ func TestWriterRetriesUntilSuccess(t *testing.T) {
 	assert.Equal(t, 3, client.calls())
 }
 
-func TestWriterGivesUpAfterRepeatedAPIRejections(t *testing.T) {
-	// The service keeps rejecting the first line; it must be dropped after
-	// maxAttempts rejections so the line behind it still gets written.
+func TestWriterGivesUpAfterRepeatedMalformedRejections(t *testing.T) {
+	// The service keeps rejecting the first line with a malformed-request error
+	// it can never accept; it must be dropped after maxAttempts so the line
+	// behind it still gets written.
 	rejection := &smithy.GenericAPIError{Code: "ValidationException", Message: "boom"}
 	client := &fakePutClient{errs: []error{rejection, rejection, rejection}}
 	w := newTestWriter(client)
 	w.maxAttempts = 3
 	go w.Run()
-	defer close(w.ch)
+	defer w.Shutdown(context.Background())
 
 	assert.True(t, w.Enqueue("poison\n"))
 	assert.True(t, w.Enqueue("healthy\n"))
@@ -151,7 +152,7 @@ func TestWriterRetriesNetworkErrorsIndefinitely(t *testing.T) {
 	w := newTestWriter(client)
 	w.maxAttempts = 3
 	go w.Run()
-	defer close(w.ch)
+	defer w.Shutdown(context.Background())
 
 	assert.True(t, w.Enqueue("echo offline\n"))
 	waitForFlush(t, w)
@@ -174,4 +175,70 @@ func TestEnqueueDropsWhenQueueFull(t *testing.T) {
 	assert.True(t, w.Enqueue("a\n"))
 	assert.False(t, w.Enqueue("b\n"))
 	assert.Equal(t, int64(1), w.Pending())
+}
+
+func TestWriterRetriesTransientErrorsIndefinitely(t *testing.T) {
+	// Throttling and credential errors are transient: they must not count
+	// towards the drop budget, so a line survives far more of them than
+	// maxAttempts before the service finally accepts it.
+	throttle := &smithy.GenericAPIError{Code: "ThrottlingException", Message: "slow down"}
+	expired := &smithy.GenericAPIError{Code: "ExpiredTokenException", Message: "creds expired"}
+	client := &fakePutClient{errs: []error{throttle, throttle, expired, expired, throttle, expired}}
+	w := newTestWriter(client)
+	w.maxAttempts = 2
+	go w.Run()
+	defer w.Shutdown(context.Background())
+
+	assert.True(t, w.Enqueue("echo hello\n"))
+	waitForFlush(t, w)
+
+	// Six transient failures then success: none counted towards the 2-attempt
+	// drop budget.
+	require.Equal(t, 7, client.calls())
+}
+
+func TestShutdownDrainsQueuedLines(t *testing.T) {
+	client := &fakePutClient{}
+	w := newTestWriter(client)
+	go w.Run()
+
+	assert.True(t, w.Enqueue("a\n"))
+	assert.True(t, w.Enqueue("b\n"))
+	assert.True(t, w.Enqueue("c\n"))
+
+	// A clean shutdown flushes everything still queued before returning.
+	remaining := w.Shutdown(context.Background())
+
+	assert.Equal(t, int64(0), remaining)
+	assert.Equal(t, 3, client.calls())
+	assert.Equal(t, int64(0), w.Pending())
+}
+
+func TestShutdownReportsUnflushedAfterDeadline(t *testing.T) {
+	// DynamoDB unreachable at shutdown: the drain cannot complete, so Shutdown
+	// must return once its deadline passes and report the unflushed line rather
+	// than block forever.
+	var errs []error
+	for range 1000 {
+		errs = append(errs, errors.New("dial tcp: network is unreachable"))
+	}
+	client := &fakePutClient{errs: errs}
+	w := newTestWriter(client)
+	w.retryDelay = 10 * time.Millisecond
+	go w.Run()
+
+	assert.True(t, w.Enqueue("echo offline\n"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	assert.Equal(t, int64(1), w.Shutdown(ctx))
+}
+
+func TestEnqueueAfterShutdownIsDropped(t *testing.T) {
+	w := newTestWriter(&fakePutClient{})
+	go w.Run()
+	w.Shutdown(context.Background())
+
+	// Enqueue must not panic on the closed channel; it reports the drop.
+	assert.False(t, w.Enqueue("late\n"))
 }

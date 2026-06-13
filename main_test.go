@@ -103,7 +103,7 @@ func TestEnsureTablePropagatesDescribeError(t *testing.T) {
 
 	err := ensureTable(context.Background(), client, "history", fastWaiter)
 
-	assert.ErrorContains(t, err, "access denied")
+	require.ErrorContains(t, err, "access denied")
 	assert.Equal(t, 0, client.createCalls)
 }
 

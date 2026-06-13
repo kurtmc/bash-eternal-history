@@ -153,7 +153,7 @@ func TestGetEmptyTable(t *testing.T) {
 	actual, err := repo.Get(context.Background())
 
 	require.NoError(t, err)
-	assert.Equal(t, "", actual)
+	assert.Empty(t, actual)
 }
 
 func TestGetPaginates(t *testing.T) {
@@ -181,8 +181,45 @@ func TestGetReturnsScanError(t *testing.T) {
 
 	actual, err := repo.Get(context.Background())
 
-	assert.ErrorContains(t, err, "boom")
-	assert.Equal(t, "", actual)
+	require.ErrorContains(t, err, "boom")
+	assert.Empty(t, actual)
+}
+
+// slowScanClient returns `pages` pages, sleeping `delay` (honoring the context
+// deadline) before each, so a test can tell a per-page timeout apart from a
+// single timeout over the whole scan.
+type slowScanClient struct {
+	pages int
+	delay time.Duration
+	call  int
+}
+
+func (s *slowScanClient) Scan(ctx context.Context, _ *dynamodb.ScanInput, _ ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	s.call++
+	out := &dynamodb.ScanOutput{Items: []map[string]types.AttributeValue{historyItem("1", "x")}}
+	if s.call < s.pages {
+		out.LastEvaluatedKey = map[string]types.AttributeValue{"timestamp": &types.AttributeValueMemberN{Value: "1"}}
+	}
+	return out, nil
+}
+
+func TestGetBoundsEachPageNotTheWholeScan(t *testing.T) {
+	// Eight pages at 20ms each is 160ms total, well over the 100ms timeout, but
+	// every individual page is far under it. A per-page deadline lets this
+	// succeed; a single deadline over the whole scan would fail partway. This
+	// is the fix for the "table outgrows the timeout and never loads" cliff.
+	client := &slowScanClient{pages: 8, delay: 20 * time.Millisecond}
+	repo := NewContentRepository(client, "test", 100*time.Millisecond)
+
+	_, err := repo.Get(context.Background())
+
+	require.NoError(t, err)
+	assert.Equal(t, 8, client.call)
 }
 
 func TestGetUsesConsistentRead(t *testing.T) {
@@ -192,6 +229,8 @@ func TestGetUsesConsistentRead(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Len(t, client.inputs, 1)
+	// A strongly consistent read keeps a just-flushed local line from being
+	// dropped by a not-yet-replicated eventually consistent scan.
 	require.NotNil(t, client.inputs[0].ConsistentRead)
 	assert.True(t, *client.inputs[0].ConsistentRead)
 }

@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"bazil.org/fuse"
@@ -31,6 +32,11 @@ type File struct {
 	// loadRetryInterval throttles synchronous load attempts after a failure
 	// so an unreachable DynamoDB does not stall the shell on every prompt.
 	loadRetryInterval time.Duration
+	// foregroundLoadTimeout bounds a load triggered from a FUSE request (Attr /
+	// Read) so a shell never wedges on a cold scan of a very large table. The
+	// background Warm and refresh loads are deliberately not bounded this way,
+	// so the table still loads fully — just off the request path.
+	foregroundLoadTimeout time.Duration
 
 	mu              sync.Mutex
 	data            []byte
@@ -47,17 +53,29 @@ type File struct {
 
 func NewFile(repo ContentGetter, writer *HistoryWriter, cacheTTL time.Duration) *File {
 	return &File{
-		repo:              repo,
-		writer:            writer,
-		uid:               uint32(os.Getuid()),
-		gid:               uint32(os.Getgid()),
-		cacheTTL:          cacheTTL,
-		loadRetryInterval: 15 * time.Second,
+		repo:                  repo,
+		writer:                writer,
+		uid:                   uint32(os.Getuid()),
+		gid:                   uint32(os.Getgid()),
+		cacheTTL:              cacheTTL,
+		loadRetryInterval:     15 * time.Second,
+		foregroundLoadTimeout: 15 * time.Second,
 	}
 }
 
-func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
+// loadForeground runs ensureLoaded for a FUSE request, bounding the load so a
+// shell never wedges on a cold scan of a very large table.
+func (f *File) loadForeground(ctx context.Context) {
+	if f.foregroundLoadTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, f.foregroundLoadTimeout)
+		defer cancel()
+	}
 	f.ensureLoaded(ctx)
+}
+
+func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
+	f.loadForeground(ctx)
 
 	f.mu.Lock()
 	size := len(f.data)
@@ -71,6 +89,21 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
+// Setattr handles metadata changes. The history file is an append-only log, so
+// any attempt to change its size (i.e. truncate it) is refused with EPERM. The
+// kernel turns an O_TRUNC open into a Setattr(size=0); without this method the
+// FUSE library answers it with silent success, so a tool that "cleared" the
+// file would appear to succeed while nothing was deleted and the content
+// reappeared on the next refresh. Failing loudly is the honest answer.
+func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+	if req.Valid.Size() {
+		return syscall.EPERM
+	}
+	// Every other attribute (mode/uid/gid/times) is fixed; report the current
+	// attributes and ignore the requested change.
+	return f.Attr(ctx, &resp.Attr)
+}
+
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
 	// Keep the page cache between opens so each new shell does not re-read
 	// the entire history through FUSE; the kernel revalidates with Getattr
@@ -81,7 +114,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 }
 
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	f.ensureLoaded(ctx)
+	f.loadForeground(ctx)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -92,13 +125,18 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 }
 
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	defer duration(track("Write()"))
-
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// The history file is an append-only log, so the kernel-supplied offset is
+	// deliberately ignored and every write is appended. Honoring the offset
+	// would let a write land mid-file when a background refresh has grown the
+	// content under a stale cached size (corrupting the local view), and would
+	// let an arbitrary pwrite offset balloon the buffer or crash the daemon.
+	// Appending is exactly what bash's `history -a` wants.
 	f.writer.Enqueue(string(req.Data))
 	f.writeSeq++
-	HandleWrite(req, resp, &f.data)
+	f.data = append(f.data, req.Data...)
+	resp.Size = len(req.Data)
 	return nil
 }
 
@@ -122,7 +160,6 @@ func (f *File) ensureLoaded(ctx context.Context) {
 		return
 	}
 	f.loading = true
-	f.lastLoadAttempt = time.Now()
 	seq := f.writeSeq
 	f.mu.Unlock()
 
@@ -132,14 +169,25 @@ func (f *File) ensureLoaded(ctx context.Context) {
 	defer f.mu.Unlock()
 	f.loading = false
 	if err != nil {
-		// Keep whatever is buffered locally; a failed load must not wipe
-		// history that has already been written this session.
+		// Stamp the throttle once the attempt has finished, not when it
+		// started: a slow failure (e.g. a black-holed network taking the full
+		// read timeout) must still leave a full loadRetryInterval before the
+		// next attempt, otherwise the very next FUSE callback would immediately
+		// start another blocking load. Keep whatever is buffered locally; a
+		// failed load must not wipe history already written this session.
+		f.lastLoadAttempt = time.Now()
 		log.Printf("WARN: could not load history content: %v", err)
 		return
 	}
 	if f.writeSeq != seq {
+		// A local write raced this first load, so the scan result is missing
+		// it. Discard the result, but do NOT stamp the throttle: the buffered
+		// local write is currently the only visible content, so the next FUSE
+		// callback must be allowed to retry and load the rest of the history
+		// rather than serve a near-empty file for a whole loadRetryInterval.
 		return
 	}
+	f.lastLoadAttempt = time.Now()
 	f.data = []byte(c)
 	f.loaded = true
 	f.loadedAt = time.Now()
@@ -174,6 +222,11 @@ func (f *File) maybeRefreshLocked() {
 			return
 		}
 		if f.writeSeq != seq {
+			// A local write raced this refresh; discard the stale result, but
+			// reset the clock anyway. Otherwise loadedAt stays expired and a
+			// steady stream of local writes would make every following FUSE
+			// callback restart a full table scan (read and allocation churn).
+			f.loadedAt = time.Now()
 			return
 		}
 		f.data = []byte(c)
@@ -181,22 +234,28 @@ func (f *File) maybeRefreshLocked() {
 	}()
 }
 
-func HandleWrite(req *fuse.WriteRequest, resp *fuse.WriteResponse, data *[]byte) {
-	size := len(req.Data)
+// Warm loads the history content in the background, off the FUSE request path,
+// and keeps retrying until it succeeds. The request-path load is bounded by
+// foregroundLoadTimeout so a shell never wedges on a cold scan; this loader is
+// deliberately unbounded so a table too large to scan within that bound still
+// loads fully here rather than failing forever on the request path, and so a
+// load that failed because the machine was offline at boot is retried once
+// connectivity returns.
+func (f *File) Warm() {
+	for {
+		f.ensureLoaded(context.Background())
 
-	if int(req.Offset)+size > len(*data) {
-		newData := make([]byte, int(req.Offset)+size)
-		copy(newData, *data)
-		*data = newData
+		f.mu.Lock()
+		loaded := f.loaded
+		f.mu.Unlock()
+		if loaded {
+			return
+		}
+
+		retry := f.loadRetryInterval
+		if retry <= 0 {
+			retry = time.Second
+		}
+		time.Sleep(retry)
 	}
-	n := copy((*data)[req.Offset:int(req.Offset)+size], req.Data)
-	resp.Size = n
-}
-
-func track(msg string) (string, time.Time) {
-	return msg, time.Now()
-}
-
-func duration(msg string, start time.Time) {
-	log.Printf("DEBUG: %v: %v\n", msg, time.Since(start))
 }

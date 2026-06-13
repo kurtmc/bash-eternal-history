@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"syscall"
 	"time"
 
@@ -26,9 +27,10 @@ func usage() {
 }
 
 type Config struct {
-	ReadContentTimeout time.Duration `envconfig:"READ_CONTENT_TIMEOUT" default:"15s"`
-	TableName          string        `envconfig:"DYNAMODB_TABLE_NAME" default:"bash-eternal-history"`
-	ContentCacheTTL    time.Duration `envconfig:"CONTENT_CACHE_TTL" default:"5m"`
+	ReadContentTimeout   time.Duration `envconfig:"READ_CONTENT_TIMEOUT" default:"15s"`
+	TableName            string        `envconfig:"DYNAMODB_TABLE_NAME" default:"bash-eternal-history"`
+	ContentCacheTTL      time.Duration `envconfig:"CONTENT_CACHE_TTL" default:"5m"`
+	ShutdownDrainTimeout time.Duration `envconfig:"SHUTDOWN_DRAIN_TIMEOUT" default:"10s"`
 }
 
 func main() {
@@ -46,7 +48,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ctx := context.Background()
+	// Cancel on a termination signal so the daemon can unmount cleanly and
+	// flush the write queue instead of being killed with history still
+	// buffered in memory.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		log.Fatalf("unable to load SDK config, %v", err)
@@ -63,6 +70,9 @@ func main() {
 
 	repo := NewContentRepository(svc, appConfig.TableName, appConfig.ReadContentTimeout)
 	file := NewFile(repo, writer, appConfig.ContentCacheTTL)
+	// Warm the content cache in the background so the first shell to read the
+	// history file does not block on a cold full-table scan.
+	go file.Warm()
 
 	c, err := fuse.Mount(
 		mountpoint,
@@ -78,11 +88,33 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer c.Close()
 
-	err = fs.Serve(c, FS{file: file})
-	if err != nil {
-		log.Fatal(err)
+	// On a termination signal, unmount so fs.Serve returns and the drain below
+	// runs. Without this the process would be killed with the queue intact.
+	go func() {
+		<-ctx.Done()
+		log.Printf("received shutdown signal, unmounting %q", mountpoint)
+		if err := fuse.Unmount(mountpoint); err != nil {
+			log.Printf("WARN: could not unmount %q: %v", mountpoint, err)
+		}
+	}()
+
+	serveErr := fs.Serve(c, FS{file: file})
+	if cerr := c.Close(); cerr != nil {
+		log.Printf("WARN: closing fuse connection: %v", cerr)
+	}
+
+	// fs.Serve has returned: a signal-triggered unmount, an external umount, or
+	// a serve error. Stop accepting writes and flush whatever is still queued
+	// so a clean stop does not silently discard buffered history.
+	drainCtx, cancel := context.WithTimeout(context.Background(), appConfig.ShutdownDrainTimeout)
+	defer cancel()
+	if remaining := writer.Shutdown(drainCtx); remaining > 0 {
+		log.Printf("WARN: shutdown drain timed out with %d history line(s) unflushed", remaining)
+	}
+
+	if serveErr != nil {
+		log.Fatal(serveErr)
 	}
 }
 
@@ -170,7 +202,7 @@ type FS struct {
 }
 
 func (f FS) Root() (fs.Node, error) {
-	return Dir{file: f.file}, nil
+	return Dir(f), nil
 }
 
 // Dir implements both Node and Handle for the root directory.
