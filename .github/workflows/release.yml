@@ -5,6 +5,10 @@ on:
     tags:
       - '*'
 
+# goreleaser needs to create the GitHub release and upload assets; nothing else.
+permissions:
+  contents: write
+
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
@@ -16,7 +20,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: 'stable'
+          # Match the module's declared Go version rather than floating
+          # "stable", so each release is built with the version under test.
+          go-version-file: go.mod
+      - name: Test
+        run: go test -race ./...
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:

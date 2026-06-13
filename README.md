@@ -58,9 +58,18 @@ Description=Mounts bash eternal history
 Type=simple
 Environment=AWS_PROFILE=bash-eternal-history
 Environment=AWS_REGION=ap-southeast-2
+# Clear a mount left wedged by a previous crash before mounting again,
+# otherwise the mountpoint stats as "transport endpoint is not connected".
+ExecStartPre=-/usr/bin/fusermount3 -uz %h/.bash-eternal-history-fuse
 ExecStartPre=/usr/bin/mkdir -p %h/.bash-eternal-history-fuse
 ExecStart=/opt/bash-eternal-history/bash-eternal-history %h/.bash-eternal-history-fuse
-ExecStop=/usr/bin/umount %h/.bash-eternal-history-fuse
+# On stop the daemon also unmounts and flushes its write queue on SIGTERM; this
+# is a lazy-unmount fallback in case the mount is busy.
+ExecStop=-/usr/bin/fusermount3 -uz %h/.bash-eternal-history-fuse
+# Recover automatically if the daemon ever dies, so a crash does not leave the
+# history file permanently wedged.
+Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=default.target
@@ -79,6 +88,11 @@ export HISTTIMEFORMAT="[%F %T] "
 export HISTFILE=~/.bash_eternal_history
 PROMPT_COMMAND="history -a; $PROMPT_COMMAND"
 ```
+This config uses `history -a`, which appends — the only write mode the
+filesystem supports. The file is an append-only log: truncating or rewriting it
+(`history -w`, `> ~/.bash_eternal_history`, editing it in place) is refused with
+`EPERM` rather than silently discarded, because the table is never rewritten.
+There is deliberately no way to delete a line through the filesystem.
 
 7. Profit.
 
@@ -89,5 +103,6 @@ The daemon is configured through environment variables:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `DYNAMODB_TABLE_NAME` | `bash-eternal-history` | DynamoDB table used to store history. Created automatically if it does not exist. |
-| `READ_CONTENT_TIMEOUT` | `15s` | Timeout for loading the history content from DynamoDB. |
+| `READ_CONTENT_TIMEOUT` | `15s` | Timeout for each page of the DynamoDB scan when loading history. Bounding each page rather than the whole scan keeps a large history loadable as it grows. |
 | `CONTENT_CACHE_TTL` | `5m` | How long loaded history is served before it is refreshed in the background, picking up commands written by other machines. Set to `0` to load only once per mount. |
+| `SHUTDOWN_DRAIN_TIMEOUT` | `10s` | How long to keep flushing queued history lines to DynamoDB on shutdown before giving up. |
