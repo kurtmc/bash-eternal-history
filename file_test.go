@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -16,40 +18,62 @@ import (
 )
 
 type fakeRepo struct {
-	mu      sync.Mutex
-	content string
-	err     error
-	calls   int
-	// gate, when non-nil, blocks Get until it is closed.
-	gate chan struct{}
-	// lastHadDeadline records whether the most recent Get's context carried a
-	// deadline, so a test can tell a bounded foreground load apart from an
-	// unbounded background one.
-	lastHadDeadline bool
+	mu         sync.Mutex
+	content    string
+	entries    []historyEntry
+	err        error
+	calls      int
+	gate       chan struct{}
+	lastCtxErr error
 }
 
-func (r *fakeRepo) Get(ctx context.Context) (string, error) {
+func (r *fakeRepo) Get(ctx context.Context) ([]historyEntry, error) {
 	r.mu.Lock()
 	r.calls++
-	_, r.lastHadDeadline = ctx.Deadline()
-	content, err, gate := r.content, r.err, r.gate
+	gate := r.gate
 	r.mu.Unlock()
 	if gate != nil {
 		<-gate
 	}
-	return content, err
-}
-
-func (r *fakeRepo) hadDeadline() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.lastHadDeadline
+	r.lastCtxErr = ctx.Err()
+	if r.err != nil {
+		return nil, r.err
+	}
+	if r.entries != nil {
+		return r.entries, nil
+	}
+	return entriesOf(r.content), nil
+}
+
+func entriesOf(content string) []historyEntry {
+	if content == "" {
+		return nil
+	}
+	var entries []historyEntry
+	for i, line := range strings.Split(strings.TrimSuffix(content, "\n"), "\n") {
+		entries = append(entries, historyEntry{timestamp: int64(i + 1), content: line})
+	}
+	return entries
+}
+
+func (r *fakeRepo) ctxErr() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastCtxErr
 }
 
 func (r *fakeRepo) setContent(content string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.content = content
+}
+
+func (r *fakeRepo) setEntries(entries []historyEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.entries = entries
 }
 
 func (r *fakeRepo) setError(err error) {
@@ -70,7 +94,7 @@ func newTestFile(t *testing.T, repo ContentGetter) *File {
 	go w.Run()
 	t.Cleanup(func() { w.Shutdown(context.Background()) })
 
-	f := NewFile(repo, w, 0)
+	f := NewFile(repo, w, 0, time.Minute)
 	f.loadRetryInterval = 0
 	return f
 }
@@ -79,14 +103,41 @@ func newTestFile(t *testing.T, repo ContentGetter) *File {
 // with the request size as its capacity.
 func readFile(t *testing.T, f *File, offset int64, size int) string {
 	t.Helper()
+	return readFileCtx(t, context.Background(), f, offset, size)
+}
+
+func readFileCtx(t *testing.T, ctx context.Context, f *File, offset int64, size int) string {
+	t.Helper()
 	resp := &fuse.ReadResponse{Data: make([]byte, 0, size)}
-	require.NoError(t, f.Read(context.Background(), &fuse.ReadRequest{Offset: offset, Size: size}, resp))
+	require.NoError(t, f.Read(ctx, &fuse.ReadRequest{Offset: offset, Size: size}, resp))
 	return string(resp.Data)
 }
 
 func readAll(t *testing.T, f *File) string {
 	t.Helper()
 	return readFile(t, f, 0, 1<<20)
+}
+
+type readResult struct {
+	data string
+	err  error
+}
+
+func readAllAsync(ctx context.Context, f *File) <-chan readResult {
+	result := make(chan readResult, 1)
+	go func() {
+		resp := &fuse.ReadResponse{Data: make([]byte, 0, 1<<20)}
+		err := f.Read(ctx, &fuse.ReadRequest{Offset: 0, Size: 1 << 20}, resp)
+		result <- readResult{data: string(resp.Data), err: err}
+	}()
+	return result
+}
+
+func awaitRead(t *testing.T, result <-chan readResult) string {
+	t.Helper()
+	r := <-result
+	require.NoError(t, r.err)
+	return r.data
 }
 
 func doWrite(t *testing.T, f *File, offset int64, data string) {
@@ -100,6 +151,17 @@ func currentData(f *File) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return string(f.data)
+}
+
+func loadInFlight(f *File) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.inflight != nil
+}
+
+func waitForLoadCount(t *testing.T, repo *fakeRepo, n int) {
+	t.Helper()
+	require.Eventually(t, func() bool { return repo.callCount() == n }, time.Second, time.Millisecond)
 }
 
 func TestFileLoadsContentOnce(t *testing.T) {
@@ -170,70 +232,150 @@ func TestFailedLoadThrottleMeasuredFromCompletion(t *testing.T) {
 	f := newTestFile(t, repo)
 	f.loadRetryInterval = 100 * time.Millisecond
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		resp := &fuse.ReadResponse{Data: make([]byte, 0, 1<<20)}
-		_ = f.Read(context.Background(), &fuse.ReadRequest{Offset: 0, Size: 1 << 20}, resp)
-	}()
-	require.Eventually(t, func() bool { return repo.callCount() == 1 }, time.Second, time.Millisecond)
+	result := readAllAsync(context.Background(), f)
+	waitForLoadCount(t, repo, 1)
 	// Hold the failing load open well past loadRetryInterval. A throttle stamped
 	// at the attempt's start would already have expired by the time it finishes.
 	time.Sleep(200 * time.Millisecond)
 	close(gate)
-	<-done
+	awaitRead(t, result)
 
 	// Stamped at completion, so an immediate retry is throttled.
 	readAll(t, f)
 	assert.Equal(t, 1, repo.callCount())
 }
 
-func TestForegroundLoadIsBoundedButWarmIsNot(t *testing.T) {
-	// A request-path (Read/Attr) load must carry a deadline so a shell never
-	// wedges on a cold scan, while the background Warm load must stay unbounded
-	// so a table too large to scan within that bound still loads fully.
-	repo := &fakeRepo{content: "x\n"}
+func TestReadWaitsForInitialLoad(t *testing.T) {
+	// bash reads its history file once at startup and never again.
+	gate := make(chan struct{})
+	repo := &fakeRepo{content: "old\n", gate: gate}
 	f := newTestFile(t, repo)
-	f.foregroundLoadTimeout = 5 * time.Second
 
-	readAll(t, f) // foreground load
-	assert.True(t, repo.hadDeadline(), "foreground load context should carry a deadline")
+	result := readAllAsync(context.Background(), f)
+	waitForLoadCount(t, repo, 1)
+	select {
+	case r := <-result:
+		t.Fatalf("read returned %q before the load finished", r.data)
+	case <-time.After(50 * time.Millisecond):
+	}
 
-	// A fresh file loaded via Warm must use an unbounded context.
-	warmed := newTestFile(t, repo)
-	warmed.Warm()
-	assert.False(t, repo.hadDeadline(), "Warm load context should not carry a deadline")
+	close(gate)
+	assert.Equal(t, "old\n", awaitRead(t, result))
 }
 
-func TestColdLoadRaceDoesNotHideHistory(t *testing.T) {
-	// A local write that races the very first (cold) load makes the load result
-	// stale, so it is discarded. The discard must NOT throttle the next load,
-	// or the entire eternal history would stay hidden behind the buffered local
-	// write for a full loadRetryInterval.
+func TestReadWaitIsBounded(t *testing.T) {
+	gate := make(chan struct{})
+	repo := &fakeRepo{content: "old\n", gate: gate}
+	f := newTestFile(t, repo)
+	f.loadWaitTimeout = 20 * time.Millisecond
+
+	result := readAllAsync(context.Background(), f)
+	select {
+	case r := <-result:
+		require.NoError(t, r.err)
+		assert.Empty(t, r.data)
+	case <-time.After(time.Second):
+		t.Fatal("read did not return after loadWaitTimeout")
+	}
+	assert.True(t, loadInFlight(f))
+
+	close(gate)
+	require.Eventually(t, func() bool { return readAll(t, f) == "old\n" }, time.Second, time.Millisecond)
+	assert.Equal(t, 1, repo.callCount())
+}
+
+func TestRequestCancellationDoesNotCancelLoad(t *testing.T) {
+	// The kernel interrupts a FUSE request when the reading process gets a signal.
+	gate := make(chan struct{})
+	repo := &fakeRepo{content: "old\n", gate: gate}
+	f := newTestFile(t, repo)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := readAllAsync(ctx, f)
+	waitForLoadCount(t, repo, 1)
+	cancel()
+	select {
+	case r := <-result:
+		require.NoError(t, r.err)
+		assert.Empty(t, r.data)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled read did not return")
+	}
+	assert.True(t, loadInFlight(f))
+
+	close(gate)
+	require.Eventually(t, func() bool { return readAll(t, f) == "old\n" }, time.Second, time.Millisecond)
+	assert.Equal(t, 1, repo.callCount())
+	require.NoError(t, repo.ctxErr(), "the reader's cancellation must not reach the load")
+}
+
+func TestConcurrentReadersShareOneLoad(t *testing.T) {
+	gate := make(chan struct{})
+	repo := &fakeRepo{content: "old\n", gate: gate}
+	f := newTestFile(t, repo)
+
+	var results []<-chan readResult
+	for range 5 {
+		results = append(results, readAllAsync(context.Background(), f))
+	}
+	waitForLoadCount(t, repo, 1)
+	time.Sleep(20 * time.Millisecond)
+	close(gate)
+
+	for _, result := range results {
+		assert.Equal(t, "old\n", awaitRead(t, result))
+	}
+	assert.Equal(t, 1, repo.callCount())
+}
+
+func TestWarmLoadsWithoutARequest(t *testing.T) {
+	repo := &fakeRepo{content: "x\n"}
+	f := newTestFile(t, repo)
+
+	f.Warm()
+
+	assert.Equal(t, 1, repo.callCount())
+	assert.Equal(t, "x\n", readAll(t, f))
+	assert.Equal(t, 1, repo.callCount())
+}
+
+func TestWriteDuringLoadIsMerged(t *testing.T) {
 	gate := make(chan struct{})
 	repo := &fakeRepo{content: "old1\nold2\n", gate: gate}
 	f := newTestFile(t, repo)
-	f.loadRetryInterval = time.Hour // a throttle here would hide history "forever"
+	f.loadRetryInterval = time.Hour
 
-	// Start the cold load; it blocks in Get until the gate is released.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		resp := &fuse.ReadResponse{Data: make([]byte, 0, 1<<20)}
-		_ = f.Read(context.Background(), &fuse.ReadRequest{Offset: 0, Size: 1 << 20}, resp)
-	}()
-	require.Eventually(t, func() bool { return repo.callCount() == 1 }, time.Second, time.Millisecond)
-
-	// A write lands while the load is in flight: it bumps writeSeq so the load
-	// result is discarded. The line is now visible in the table too.
+	result := readAllAsync(context.Background(), f)
+	waitForLoadCount(t, repo, 1)
 	doWrite(t, f, 0, "echo new\n")
-	repo.setContent("old1\nold2\necho new\n")
 	close(gate)
-	<-done
+
+	assert.Equal(t, "old1\nold2\necho new\n", awaitRead(t, result))
+	assert.Equal(t, 1, repo.callCount())
+}
+
+func TestWriteAlreadyInScanIsNotDuplicated(t *testing.T) {
+	// The write was flushed before the scan reached its key, so the scan has it.
+	gate := make(chan struct{})
+	repo := &fakeRepo{gate: gate}
+	f := newTestFile(t, repo)
+	client := f.writer.svc.(*fakePutClient)
+
+	result := readAllAsync(context.Background(), f)
+	waitForLoadCount(t, repo, 1)
+	doWrite(t, f, 0, "echo new\n")
 	waitForFlush(t, f.writer)
 
-	// The next read must retry (not be throttled) and surface the full history.
-	assert.Equal(t, "old1\nold2\necho new\n", readAll(t, f))
+	stored, err := strconv.ParseInt(client.input(0).Item["timestamp"].(*types.AttributeValueMemberN).Value, 10, 64)
+	require.NoError(t, err)
+	repo.setEntries([]historyEntry{
+		{timestamp: 1, content: "old1"},
+		{timestamp: 2, content: "old2"},
+		{timestamp: stored, content: "echo new"},
+	})
+	close(gate)
+
+	assert.Equal(t, "old1\nold2\necho new\n", awaitRead(t, result))
 }
 
 func TestLoadRecoversAfterError(t *testing.T) {
@@ -278,7 +420,7 @@ func TestRefreshWaitsForPendingWrites(t *testing.T) {
 	repo := &fakeRepo{content: "a\n"}
 	w := newTestWriter(&fakePutClient{})
 	// Run() is intentionally not started, so enqueued lines stay pending.
-	f := NewFile(repo, w, time.Millisecond)
+	f := NewFile(repo, w, time.Millisecond, time.Minute)
 	f.loadRetryInterval = 0
 
 	assert.Equal(t, "a\n", readAll(t, f))
@@ -295,7 +437,7 @@ func TestRefreshWaitsForPendingWrites(t *testing.T) {
 	assert.NotContains(t, currentData(f), "REMOTE")
 }
 
-func TestRefreshDiscardedWhenWriteRacesIt(t *testing.T) {
+func TestRefreshMergesWriteThatRacesIt(t *testing.T) {
 	repo := &fakeRepo{content: "a\n"}
 	f := newTestFile(t, repo)
 	f.cacheTTL = time.Nanosecond
@@ -311,22 +453,15 @@ func TestRefreshDiscardedWhenWriteRacesIt(t *testing.T) {
 	repo.mu.Unlock()
 
 	require.NoError(t, f.Attr(context.Background(), &fuse.Attr{}))
-	require.Eventually(t, func() bool { return repo.callCount() == 2 }, time.Second, time.Millisecond)
+	waitForLoadCount(t, repo, 2)
 
 	// A write lands while the refresh is in flight.
 	doWrite(t, f, 2, "echo local\n")
 	close(gate)
 
-	require.Eventually(t, func() bool {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		return !f.refreshing
-	}, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return !loadInFlight(f) }, time.Second, time.Millisecond)
 
-	// The stale refresh result must be discarded so it cannot hide the
-	// write that raced it.
-	assert.Contains(t, currentData(f), "echo local\n")
-	assert.NotContains(t, currentData(f), "REMOTE")
+	assert.Equal(t, "a\nREMOTE\necho local\n", currentData(f))
 }
 
 func TestConcurrentReadsWritesAndAttrs(t *testing.T) {
@@ -374,7 +509,7 @@ func TestWriteEnqueuesEveryLine(t *testing.T) {
 	client := w.svc.(*fakePutClient)
 	go w.Run()
 	t.Cleanup(func() { w.Shutdown(context.Background()) })
-	f := NewFile(repo, w, 0)
+	f := NewFile(repo, w, 0, time.Minute)
 	f.loadRetryInterval = 0
 	require.Empty(t, readAll(t, f))
 
@@ -409,4 +544,21 @@ func TestSetattrAllowsNonSizeChanges(t *testing.T) {
 	resp := &fuse.SetattrResponse{}
 	require.NoError(t, f.Setattr(context.Background(), &fuse.SetattrRequest{Valid: fuse.SetattrMtime}, resp))
 	assert.Equal(t, uint64(4), resp.Attr.Size)
+}
+
+func TestMergeLocalWritesKeepsUnstoredAndDropsStored(t *testing.T) {
+	entries := []historyEntry{
+		{timestamp: 1, content: "old"},
+		{timestamp: 100, content: "#1\nflushed"},
+		{timestamp: 150, content: "other machine"},
+	}
+	writes := []localWrite{
+		{timestamp: 100, data: []byte("#1\nflushed\n")},
+		{timestamp: 120, data: []byte("not flushed yet\n")},
+		{timestamp: 150, data: []byte("same timestamp, different line\n")},
+	}
+
+	got := string(mergeLocalWrites(entries, writes))
+
+	assert.Equal(t, "old\n#1\nflushed\nother machine\nnot flushed yet\nsame timestamp, different line\n", got)
 }

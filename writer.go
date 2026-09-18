@@ -84,10 +84,11 @@ func (w *HistoryWriter) Pending() int64 {
 	return w.pending.Load()
 }
 
-// Enqueue queues a history line for writing. When the queue is full, or the
-// writer has been shut down, the line is dropped instead: blocking here would
-// hang the user's shell on every prompt for as long as DynamoDB is unreachable.
-func (w *HistoryWriter) Enqueue(content string) bool {
+// Enqueue queues a history line for writing and returns the timestamp that
+// becomes the line's hash key. When the queue is full, or the writer has been
+// shut down, the line is dropped instead: blocking here would hang the user's
+// shell on every prompt for as long as DynamoDB is unreachable.
+func (w *HistoryWriter) Enqueue(content string) (int64, bool) {
 	m := AppendHistoryMessage{
 		Content:   content,
 		Timestamp: time.Now().UnixNano(),
@@ -99,16 +100,16 @@ func (w *HistoryWriter) Enqueue(content string) bool {
 	defer w.mu.Unlock()
 	if w.closed {
 		log.Printf("WARN: history write queue is closed, dropping line")
-		return false
+		return m.Timestamp, false
 	}
 	w.pending.Add(1)
 	select {
 	case w.ch <- m:
-		return true
+		return m.Timestamp, true
 	default:
 		w.pending.Add(-1)
 		log.Printf("WARN: history write queue is full, dropping line")
-		return false
+		return m.Timestamp, false
 	}
 }
 

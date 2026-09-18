@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,17 +19,26 @@ type scanPage struct {
 }
 
 type fakeScanClient struct {
+	mu     sync.Mutex
 	pages  []scanPage
 	inputs []*dynamodb.ScanInput
 }
 
 func (f *fakeScanClient) Scan(ctx context.Context, in *dynamodb.ScanInput, _ ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	call := len(f.inputs)
 	f.inputs = append(f.inputs, in)
 	if call >= len(f.pages) {
 		return &dynamodb.ScanOutput{}, nil
 	}
 	return f.pages[call].out, f.pages[call].err
+}
+
+func getContent(t *testing.T, repo *ContentRepository) (string, error) {
+	t.Helper()
+	entries, err := repo.Get(context.Background())
+	return string(renderEntries(entries)), err
 }
 
 func historyItem(timestamp, content string) map[string]types.AttributeValue {
@@ -40,7 +50,7 @@ func historyItem(timestamp, content string) map[string]types.AttributeValue {
 
 func newTestRepository(pages ...scanPage) (*ContentRepository, *fakeScanClient) {
 	client := &fakeScanClient{pages: pages}
-	return NewContentRepository(client, "test", time.Second), client
+	return NewContentRepository(client, "test", time.Second, 1), client
 }
 
 func singlePage(items ...map[string]types.AttributeValue) scanPage {
@@ -55,7 +65,7 @@ func TestGetSortsByTimestamp(t *testing.T) {
 		historyItem("1713416085", "afsd"),
 	))
 
-	actual, err := repo.Get(context.Background())
+	actual, err := getContent(t, repo)
 
 	require.NoError(t, err)
 	assert.Equal(t, "123\ndef\nabc\nafsd\n", actual)
@@ -69,7 +79,7 @@ func TestGetSortsNumericallyNotLexically(t *testing.T) {
 		historyItem("10", "second"),
 	))
 
-	actual, err := repo.Get(context.Background())
+	actual, err := getContent(t, repo)
 
 	require.NoError(t, err)
 	assert.Equal(t, "first\nsecond\nthird\n", actual)
@@ -81,7 +91,7 @@ func TestGetHandlesTimestampsBeyond32Bits(t *testing.T) {
 		historyItem("1713416083000000000", "nanosecond precision"),
 	))
 
-	actual, err := repo.Get(context.Background())
+	actual, err := getContent(t, repo)
 
 	require.NoError(t, err)
 	assert.Equal(t, "nanosecond precision\nmax int64\n", actual)
@@ -115,7 +125,7 @@ func TestGetSkipsMalformedItems(t *testing.T) {
 		},
 	))
 
-	actual, err := repo.Get(context.Background())
+	actual, err := getContent(t, repo)
 
 	require.NoError(t, err)
 	assert.Equal(t, "ok\n", actual)
@@ -129,7 +139,7 @@ func TestGetStripsTrailingNewlines(t *testing.T) {
 		historyItem("2", "#1713416083\necho hi\n"),
 	))
 
-	actual, err := repo.Get(context.Background())
+	actual, err := getContent(t, repo)
 
 	require.NoError(t, err)
 	assert.Equal(t, "ls -la\n#1713416083\necho hi\n", actual)
@@ -141,7 +151,7 @@ func TestGetSkipsEmptyEntries(t *testing.T) {
 		historyItem("2", "real"),
 	))
 
-	actual, err := repo.Get(context.Background())
+	actual, err := getContent(t, repo)
 
 	require.NoError(t, err)
 	assert.Equal(t, "real\n", actual)
@@ -150,7 +160,7 @@ func TestGetSkipsEmptyEntries(t *testing.T) {
 func TestGetEmptyTable(t *testing.T) {
 	repo, _ := newTestRepository(singlePage())
 
-	actual, err := repo.Get(context.Background())
+	actual, err := getContent(t, repo)
 
 	require.NoError(t, err)
 	assert.Empty(t, actual)
@@ -168,7 +178,7 @@ func TestGetPaginates(t *testing.T) {
 		singlePage(historyItem("1", "a")),
 	)
 
-	actual, err := repo.Get(context.Background())
+	actual, err := getContent(t, repo)
 
 	require.NoError(t, err)
 	assert.Equal(t, "a\nb\n", actual)
@@ -179,7 +189,7 @@ func TestGetPaginates(t *testing.T) {
 func TestGetReturnsScanError(t *testing.T) {
 	repo, _ := newTestRepository(scanPage{err: errors.New("boom")})
 
-	actual, err := repo.Get(context.Background())
+	actual, err := getContent(t, repo)
 
 	require.ErrorContains(t, err, "boom")
 	assert.Empty(t, actual)
@@ -214,7 +224,7 @@ func TestGetBoundsEachPageNotTheWholeScan(t *testing.T) {
 	// succeed; a single deadline over the whole scan would fail partway. This
 	// is the fix for the "table outgrows the timeout and never loads" cliff.
 	client := &slowScanClient{pages: 8, delay: 20 * time.Millisecond}
-	repo := NewContentRepository(client, "test", 100*time.Millisecond)
+	repo := NewContentRepository(client, "test", 100*time.Millisecond, 1)
 
 	_, err := repo.Get(context.Background())
 
@@ -233,4 +243,76 @@ func TestGetUsesConsistentRead(t *testing.T) {
 	// dropped by a not-yet-replicated eventually consistent scan.
 	require.NotNil(t, client.inputs[0].ConsistentRead)
 	assert.True(t, *client.inputs[0].ConsistentRead)
+}
+
+func TestGetSingleSegmentOmitsSegmentFields(t *testing.T) {
+	repo, client := newTestRepository(singlePage())
+
+	_, err := repo.Get(context.Background())
+
+	require.NoError(t, err)
+	require.Len(t, client.inputs, 1)
+	assert.Nil(t, client.inputs[0].Segment)
+	assert.Nil(t, client.inputs[0].TotalSegments)
+}
+
+type segmentedScanClient struct {
+	mu     sync.Mutex
+	items  map[int32][]map[string]types.AttributeValue
+	errs   map[int32]error
+	inputs []*dynamodb.ScanInput
+}
+
+func (s *segmentedScanClient) Scan(ctx context.Context, in *dynamodb.ScanInput, _ ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
+	s.mu.Lock()
+	s.inputs = append(s.inputs, in)
+	segment := *in.Segment
+	items, err := s.items[segment], s.errs[segment]
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if items == nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Second):
+			return nil, errors.New("segment was never cancelled")
+		}
+	}
+	return &dynamodb.ScanOutput{Items: items}, nil
+}
+
+func TestGetScansSegmentsInParallelAndMergesInOrder(t *testing.T) {
+	client := &segmentedScanClient{items: map[int32][]map[string]types.AttributeValue{
+		0: {historyItem("30", "c"), historyItem("10", "a")},
+		1: {historyItem("20", "b")},
+		2: {historyItem("40", "d")},
+	}}
+	repo := NewContentRepository(client, "test", time.Second, 3)
+
+	actual, err := getContent(t, repo)
+
+	require.NoError(t, err)
+	assert.Equal(t, "a\nb\nc\nd\n", actual)
+	require.Len(t, client.inputs, 3)
+	var segments []int32
+	for _, in := range client.inputs {
+		assert.Equal(t, int32(3), *in.TotalSegments)
+		segments = append(segments, *in.Segment)
+	}
+	assert.ElementsMatch(t, []int32{0, 1, 2}, segments)
+}
+
+func TestGetReportsSegmentFailureNotTheCancellationItCauses(t *testing.T) {
+	client := &segmentedScanClient{
+		items: map[int32][]map[string]types.AttributeValue{0: {historyItem("1", "a")}},
+		errs:  map[int32]error{1: errors.New("boom")},
+	}
+	repo := NewContentRepository(client, "test", time.Second, 3)
+
+	_, err := repo.Get(context.Background())
+
+	require.ErrorContains(t, err, "boom")
+	assert.NotErrorIs(t, err, context.Canceled)
 }

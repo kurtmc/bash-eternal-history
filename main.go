@@ -28,6 +28,8 @@ func usage() {
 
 type Config struct {
 	ReadContentTimeout   time.Duration `envconfig:"READ_CONTENT_TIMEOUT" default:"15s"`
+	ScanSegments         int32         `envconfig:"SCAN_SEGMENTS" default:"8"`
+	LoadWaitTimeout      time.Duration `envconfig:"LOAD_WAIT_TIMEOUT" default:"30s"`
 	TableName            string        `envconfig:"DYNAMODB_TABLE_NAME" default:"bash-eternal-history"`
 	ContentCacheTTL      time.Duration `envconfig:"CONTENT_CACHE_TTL" default:"5m"`
 	ShutdownDrainTimeout time.Duration `envconfig:"SHUTDOWN_DRAIN_TIMEOUT" default:"10s"`
@@ -68,10 +70,8 @@ func main() {
 	writer := NewHistoryWriter(svc, appConfig.TableName)
 	go writer.Run()
 
-	repo := NewContentRepository(svc, appConfig.TableName, appConfig.ReadContentTimeout)
-	file := NewFile(repo, writer, appConfig.ContentCacheTTL)
-	// Warm the content cache in the background so the first shell to read the
-	// history file does not block on a cold full-table scan.
+	repo := NewContentRepository(svc, appConfig.TableName, appConfig.ReadContentTimeout, appConfig.ScanSegments)
+	file := NewFile(repo, writer, appConfig.ContentCacheTTL, appConfig.LoadWaitTimeout)
 	go file.Warm()
 
 	c, err := fuse.Mount(

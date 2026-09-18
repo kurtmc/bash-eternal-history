@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,13 +20,18 @@ type ContentRepository struct {
 	svc         dynamodb.ScanAPIClient
 	tableName   string
 	readTimeout time.Duration
+	segments    int32
 }
 
-func NewContentRepository(svc dynamodb.ScanAPIClient, tableName string, readTimeout time.Duration) *ContentRepository {
+func NewContentRepository(svc dynamodb.ScanAPIClient, tableName string, readTimeout time.Duration, segments int32) *ContentRepository {
+	if segments < 1 {
+		segments = 1
+	}
 	return &ContentRepository{
 		svc:         svc,
 		tableName:   tableName,
 		readTimeout: readTimeout,
+		segments:    segments,
 	}
 }
 
@@ -33,30 +40,82 @@ type historyEntry struct {
 	content   string
 }
 
-func (c *ContentRepository) readContent(ctx context.Context) (string, error) {
-	paginator := dynamodb.NewScanPaginator(c.svc, &dynamodb.ScanInput{
-		TableName: &c.tableName,
-		// A strongly consistent read makes a line that was just flushed by the
-		// writer visible to this scan immediately. Without it an eventually
-		// consistent replica can omit a just-written line, and because the scan
-		// result replaces the in-memory buffer wholesale, that line would
-		// vanish from the local view until a later refresh — hiding a command
-		// the user just ran. The Pending gate guarantees the flush completed,
-		// not that the replica it lands on has caught up.
-		ConsistentRead: aws.Bool(true),
+func (c *ContentRepository) Get(ctx context.Context) ([]historyEntry, error) {
+	entries, err := c.readEntries(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("could not retrieve data from dynamodb: %w", err)
+	}
+	return entries, nil
+}
+
+func (c *ContentRepository) readEntries(ctx context.Context) ([]historyEntry, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make([][]historyEntry, c.segments)
+	errs := make([]error, c.segments)
+	var wg sync.WaitGroup
+	for i := range c.segments {
+		wg.Go(func() {
+			results[i], errs[i] = c.readSegment(ctx, i)
+			if errs[i] != nil {
+				cancel()
+			}
+		})
+	}
+	wg.Wait()
+
+	if err := firstCause(errs); err != nil {
+		return nil, err
+	}
+
+	total := 0
+	for _, r := range results {
+		total += len(r)
+	}
+	entries := make([]historyEntry, 0, total)
+	for _, r := range results {
+		entries = append(entries, r...)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].timestamp < entries[j].timestamp
 	})
+	return entries, nil
+}
+
+func firstCause(errs []error) error {
+	var canceled error
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, context.Canceled) {
+			return err
+		}
+		canceled = err
+	}
+	return canceled
+}
+
+func (c *ContentRepository) readSegment(ctx context.Context, segment int32) ([]historyEntry, error) {
+	input := &dynamodb.ScanInput{
+		TableName: &c.tableName,
+		// Strongly consistent so a line the writer just flushed is never missing from the scan that replaces the local view.
+		ConsistentRead: aws.Bool(true),
+	}
+	if c.segments > 1 {
+		input.Segment = aws.Int32(segment)
+		input.TotalSegments = aws.Int32(c.segments)
+	}
+	paginator := dynamodb.NewScanPaginator(c.svc, input)
 
 	var entries []historyEntry
 	for paginator.HasMorePages() {
-		// Bound each page rather than the whole scan. A single deadline over
-		// the entire paginated scan would make every load fail outright once
-		// the eternal history grew past what fits in readTimeout; per-page
-		// deadlines let an arbitrarily large table load page by page.
 		pageCtx, cancel := context.WithTimeout(ctx, c.readTimeout)
 		output, err := paginator.NextPage(pageCtx)
 		cancel()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		for _, item := range output.Items {
 			entry, ok := parseItem(item)
@@ -71,17 +130,7 @@ func (c *ContentRepository) readContent(ctx context.Context) (string, error) {
 			entries = append(entries, entry)
 		}
 	}
-
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].timestamp < entries[j].timestamp
-	})
-
-	var b strings.Builder
-	for _, entry := range entries {
-		b.WriteString(entry.content)
-		b.WriteByte('\n')
-	}
-	return b.String(), nil
+	return entries, nil
 }
 
 // parseItem extracts a history entry, rejecting items that do not have the
@@ -105,10 +154,15 @@ func parseItem(item map[string]types.AttributeValue) (historyEntry, bool) {
 	return historyEntry{timestamp: timestamp, content: content}, true
 }
 
-func (c *ContentRepository) Get(ctx context.Context) (string, error) {
-	content, err := c.readContent(ctx)
-	if err != nil {
-		return "", fmt.Errorf("could not retrieve data from dynamodb: %w", err)
+func renderEntries(entries []historyEntry) []byte {
+	size := 0
+	for _, entry := range entries {
+		size += len(entry.content) + 1
 	}
-	return content, nil
+	data := make([]byte, 0, size)
+	for _, entry := range entries {
+		data = append(data, entry.content...)
+		data = append(data, '\n')
+	}
+	return data
 }

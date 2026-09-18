@@ -59,13 +59,33 @@ func waitForFlush(t *testing.T, w *HistoryWriter) {
 	require.Eventually(t, func() bool { return w.Pending() == 0 }, 5*time.Second, time.Millisecond)
 }
 
+func enqueue(t *testing.T, w *HistoryWriter, content string) bool {
+	t.Helper()
+	_, ok := w.Enqueue(content)
+	return ok
+}
+
+func TestEnqueueReturnsStoredTimestamp(t *testing.T) {
+	client := &fakePutClient{}
+	w := newTestWriter(client)
+	go w.Run()
+	defer w.Shutdown(context.Background())
+
+	timestamp, ok := w.Enqueue("echo hello\n")
+	require.True(t, ok)
+	waitForFlush(t, w)
+
+	stored := client.input(0).Item["timestamp"].(*types.AttributeValueMemberN).Value
+	assert.Equal(t, strconv.FormatInt(timestamp, 10), stored)
+}
+
 func TestWriterWritesItem(t *testing.T) {
 	client := &fakePutClient{}
 	w := newTestWriter(client)
 	go w.Run()
 	defer w.Shutdown(context.Background())
 
-	assert.True(t, w.Enqueue("echo hello\n"))
+	assert.True(t, enqueue(t, w, "echo hello\n"))
 	waitForFlush(t, w)
 
 	require.Equal(t, 1, client.calls())
@@ -91,8 +111,8 @@ func TestWriterUsesDistinctRangeKeys(t *testing.T) {
 	go w.Run()
 	defer w.Shutdown(context.Background())
 
-	assert.True(t, w.Enqueue("a\n"))
-	assert.True(t, w.Enqueue("b\n"))
+	assert.True(t, enqueue(t, w, "a\n"))
+	assert.True(t, enqueue(t, w, "b\n"))
 	waitForFlush(t, w)
 
 	require.Equal(t, 2, client.calls())
@@ -115,7 +135,7 @@ func TestWriterRetriesUntilSuccess(t *testing.T) {
 	go w.Run()
 	defer w.Shutdown(context.Background())
 
-	assert.True(t, w.Enqueue("echo hello\n"))
+	assert.True(t, enqueue(t, w, "echo hello\n"))
 	waitForFlush(t, w)
 
 	assert.Equal(t, 3, client.calls())
@@ -132,8 +152,8 @@ func TestWriterGivesUpAfterRepeatedMalformedRejections(t *testing.T) {
 	go w.Run()
 	defer w.Shutdown(context.Background())
 
-	assert.True(t, w.Enqueue("poison\n"))
-	assert.True(t, w.Enqueue("healthy\n"))
+	assert.True(t, enqueue(t, w, "poison\n"))
+	assert.True(t, enqueue(t, w, "healthy\n"))
 	waitForFlush(t, w)
 
 	require.Equal(t, 4, client.calls())
@@ -154,7 +174,7 @@ func TestWriterRetriesNetworkErrorsIndefinitely(t *testing.T) {
 	go w.Run()
 	defer w.Shutdown(context.Background())
 
-	assert.True(t, w.Enqueue("echo offline\n"))
+	assert.True(t, enqueue(t, w, "echo offline\n"))
 	waitForFlush(t, w)
 
 	require.Equal(t, 11, client.calls())
@@ -172,8 +192,8 @@ func TestEnqueueDropsWhenQueueFull(t *testing.T) {
 	w.ch = make(chan AppendHistoryMessage, 1)
 	// Run() is intentionally not started, so the queue cannot drain.
 
-	assert.True(t, w.Enqueue("a\n"))
-	assert.False(t, w.Enqueue("b\n"))
+	assert.True(t, enqueue(t, w, "a\n"))
+	assert.False(t, enqueue(t, w, "b\n"))
 	assert.Equal(t, int64(1), w.Pending())
 }
 
@@ -189,7 +209,7 @@ func TestWriterRetriesTransientErrorsIndefinitely(t *testing.T) {
 	go w.Run()
 	defer w.Shutdown(context.Background())
 
-	assert.True(t, w.Enqueue("echo hello\n"))
+	assert.True(t, enqueue(t, w, "echo hello\n"))
 	waitForFlush(t, w)
 
 	// Six transient failures then success: none counted towards the 2-attempt
@@ -202,9 +222,9 @@ func TestShutdownDrainsQueuedLines(t *testing.T) {
 	w := newTestWriter(client)
 	go w.Run()
 
-	assert.True(t, w.Enqueue("a\n"))
-	assert.True(t, w.Enqueue("b\n"))
-	assert.True(t, w.Enqueue("c\n"))
+	assert.True(t, enqueue(t, w, "a\n"))
+	assert.True(t, enqueue(t, w, "b\n"))
+	assert.True(t, enqueue(t, w, "c\n"))
 
 	// A clean shutdown flushes everything still queued before returning.
 	remaining := w.Shutdown(context.Background())
@@ -227,7 +247,7 @@ func TestShutdownReportsUnflushedAfterDeadline(t *testing.T) {
 	w.retryDelay = 10 * time.Millisecond
 	go w.Run()
 
-	assert.True(t, w.Enqueue("echo offline\n"))
+	assert.True(t, enqueue(t, w, "echo offline\n"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -240,5 +260,5 @@ func TestEnqueueAfterShutdownIsDropped(t *testing.T) {
 	w.Shutdown(context.Background())
 
 	// Enqueue must not panic on the closed channel; it reports the drop.
-	assert.False(t, w.Enqueue("late\n"))
+	assert.False(t, enqueue(t, w, "late\n"))
 }
