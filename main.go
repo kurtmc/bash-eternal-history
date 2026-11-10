@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -55,6 +58,8 @@ func main() {
 	// buffered in memory.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// The first signal is graceful. A second one kills the process.
+	context.AfterFunc(ctx, stop)
 
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
@@ -89,24 +94,18 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// On a termination signal, unmount so fs.Serve returns and the drain below
-	// runs. Without this the process would be killed with the queue intact.
+	served := make(chan error, 1)
 	go func() {
-		<-ctx.Done()
-		log.Printf("received shutdown signal, unmounting %q", mountpoint)
-		if err := fuse.Unmount(mountpoint); err != nil {
-			log.Printf("WARN: could not unmount %q: %v", mountpoint, err)
+		err := fs.Serve(c, FS{file: file})
+		if cerr := c.Close(); cerr != nil {
+			log.Printf("WARN: closing fuse connection: %v", cerr)
 		}
+		served <- err
 	}()
+	serveErr := awaitShutdown(ctx, served, mountpoint, fuse.Unmount, detach)
 
-	serveErr := fs.Serve(c, FS{file: file})
-	if cerr := c.Close(); cerr != nil {
-		log.Printf("WARN: closing fuse connection: %v", cerr)
-	}
-
-	// fs.Serve has returned: a signal-triggered unmount, an external umount, or
-	// a serve error. Stop accepting writes and flush whatever is still queued
-	// so a clean stop does not silently discard buffered history.
+	// Stop accepting writes and flush whatever is still queued so a clean stop
+	// does not silently discard buffered history.
 	drainCtx, cancel := context.WithTimeout(context.Background(), appConfig.ShutdownDrainTimeout)
 	defer cancel()
 	if remaining := writer.Shutdown(drainCtx); remaining > 0 {
@@ -116,6 +115,35 @@ func main() {
 	if serveErr != nil {
 		log.Fatal(serveErr)
 	}
+}
+
+// A busy mount keeps fs.Serve running while a file is held open, so after a
+// failed unmount this detaches the mountpoint and returns without waiting.
+func awaitShutdown(ctx context.Context, served <-chan error, mountpoint string, unmount, detach func(string) error) error {
+	select {
+	case err := <-served:
+		return err
+	case <-ctx.Done():
+	}
+
+	slog.InfoContext(ctx, "received shutdown signal, unmounting", slog.String("mountpoint", mountpoint))
+	err := unmount(mountpoint)
+	if err == nil {
+		return <-served
+	}
+	slog.WarnContext(ctx, "could not unmount, detaching the mountpoint instead", slog.String("mountpoint", mountpoint), slog.Any("error", err))
+	if err := detach(mountpoint); err != nil {
+		slog.WarnContext(ctx, "could not detach the mountpoint", slog.String("mountpoint", mountpoint), slog.Any("error", err))
+	}
+	return nil
+}
+
+func detach(mountpoint string) error {
+	out, err := exec.Command("fusermount3", "-u", "-z", mountpoint).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
+	}
+	return nil
 }
 
 // TableClient is the subset of the DynamoDB API needed to ensure the history

@@ -130,3 +130,60 @@ func TestEnsureTablePropagatesCreateError(t *testing.T) {
 
 	assert.ErrorContains(t, err, "limit exceeded")
 }
+
+var errServe = errors.New("serve failed")
+
+func mustNotBeCalled(t *testing.T, name string) func(string) error {
+	return func(string) error {
+		t.Errorf("%s must not be called", name)
+		return nil
+	}
+}
+
+func signalled() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+func TestAwaitShutdownReturnsServeResultWithoutASignal(t *testing.T) {
+	served := make(chan error, 1)
+	served <- errServe
+
+	err := awaitShutdown(context.Background(), served, "/mnt", mustNotBeCalled(t, "unmount"), mustNotBeCalled(t, "detach"))
+
+	assert.ErrorIs(t, err, errServe)
+}
+
+func TestAwaitShutdownWaitsForServeAfterACleanUnmount(t *testing.T) {
+	served := make(chan error)
+	unmount := func(string) error {
+		go func() { served <- errServe }()
+		return nil
+	}
+
+	err := awaitShutdown(signalled(), served, "/mnt", unmount, mustNotBeCalled(t, "detach"))
+
+	assert.ErrorIs(t, err, errServe)
+}
+
+func TestAwaitShutdownDoesNotWaitForServeWhenTheMountIsBusy(t *testing.T) {
+	stillServing := make(chan error)
+	busy := func(string) error { return errors.New("device or resource busy") }
+	detached := make(chan string, 1)
+	detach := func(mountpoint string) error {
+		detached <- mountpoint
+		return nil
+	}
+
+	returned := make(chan error, 1)
+	go func() { returned <- awaitShutdown(signalled(), stillServing, "/mnt", busy, detach) }()
+
+	select {
+	case err := <-returned:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("awaitShutdown waited for a filesystem that a busy mount keeps serving")
+	}
+	assert.Equal(t, "/mnt", <-detached)
+}
