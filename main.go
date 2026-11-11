@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -36,6 +37,19 @@ type Config struct {
 	TableName            string        `envconfig:"DYNAMODB_TABLE_NAME" default:"bash-eternal-history"`
 	ContentCacheTTL      time.Duration `envconfig:"CONTENT_CACHE_TTL" default:"5m"`
 	ShutdownDrainTimeout time.Duration `envconfig:"SHUTDOWN_DRAIN_TIMEOUT" default:"10s"`
+	JournalDir           string        `envconfig:"JOURNAL_DIR"`
+}
+
+func defaultJournalDir(tableName string) (string, error) {
+	state := os.Getenv("XDG_STATE_HOME")
+	if state == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		state = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(state, "bash-eternal-history", tableName), nil
 }
 
 func main() {
@@ -72,7 +86,22 @@ func main() {
 	// retry on their own until the table is available.
 	go ensureTableWithRetry(ctx, svc, appConfig.TableName, 30*time.Second)
 
-	writer := NewHistoryWriter(svc, appConfig.TableName)
+	if appConfig.JournalDir == "" {
+		if appConfig.JournalDir, err = defaultJournalDir(appConfig.TableName); err != nil {
+			slog.ErrorContext(ctx, "unable to locate the write journal, set JOURNAL_DIR", slog.Any("error", err))
+			os.Exit(1)
+		}
+	}
+	j, err := openJournal(appConfig.JournalDir)
+	if err != nil {
+		slog.ErrorContext(ctx, "unable to open the write journal", slog.Any("error", err))
+		os.Exit(1)
+	}
+	writer, err := NewHistoryWriter(svc, appConfig.TableName, j)
+	if err != nil {
+		slog.ErrorContext(ctx, "unable to start the history writer", slog.Any("error", err))
+		os.Exit(1)
+	}
 	go writer.Run()
 
 	repo := NewContentRepository(svc, appConfig.TableName, appConfig.ReadContentTimeout, appConfig.ScanSegments)
@@ -109,7 +138,7 @@ func main() {
 	drainCtx, cancel := context.WithTimeout(context.Background(), appConfig.ShutdownDrainTimeout)
 	defer cancel()
 	if remaining := writer.Shutdown(drainCtx); remaining > 0 {
-		log.Printf("WARN: shutdown drain timed out with %d history line(s) unflushed", remaining)
+		slog.WarnContext(ctx, "shutdown drain timed out, unflushed lines stay in the journal and are written at the next start", slog.Int64("lines", remaining), slog.String("journal_dir", appConfig.JournalDir))
 	}
 
 	if serveErr != nil {

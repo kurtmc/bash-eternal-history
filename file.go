@@ -46,6 +46,10 @@ type File struct {
 }
 
 func NewFile(repo ContentGetter, writer *HistoryWriter, cacheTTL, loadWaitTimeout time.Duration) *File {
+	var data []byte
+	for _, m := range writer.Unflushed() {
+		data = append(data, m.Content...)
+	}
 	return &File{
 		repo:              repo,
 		writer:            writer,
@@ -54,6 +58,7 @@ func NewFile(repo ContentGetter, writer *HistoryWriter, cacheTTL, loadWaitTimeou
 		cacheTTL:          cacheTTL,
 		loadRetryInterval: 15 * time.Second,
 		loadWaitTimeout:   loadWaitTimeout,
+		data:              data,
 	}
 }
 
@@ -116,7 +121,10 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	// content under a stale cached size (corrupting the local view), and would
 	// let an arbitrary pwrite offset balloon the buffer or crash the daemon.
 	// Appending is exactly what bash's `history -a` wants.
-	timestamp, _ := f.writer.Enqueue(string(req.Data))
+	timestamp, ok := f.writer.Enqueue(string(req.Data))
+	if !ok {
+		return syscall.EIO
+	}
 	if f.inflight != nil {
 		f.writesDuringLoad = append(f.writesDuringLoad, localWrite{timestamp: timestamp, data: bytes.Clone(req.Data)})
 	}
@@ -156,12 +164,19 @@ func (f *File) startLoadLocked() <-chan struct{} {
 	if time.Since(f.lastLoadAttempt) < f.loadRetryInterval {
 		return nil
 	}
-	if f.writer.Pending() > 0 {
+	// While DynamoDB is unreachable a load can only fail, and a shell would
+	// block on each attempt.
+	if f.writer.Stalled() {
 		return nil
 	}
 	done := make(chan struct{})
 	f.inflight = done
+	// Unflushed lines may be missing from the scan, so they are merged into
+	// its result like writes made while it runs.
 	f.writesDuringLoad = nil
+	for _, m := range f.writer.Unflushed() {
+		f.writesDuringLoad = append(f.writesDuringLoad, localWrite{timestamp: m.Timestamp, data: []byte(m.Content)})
+	}
 	go f.load(done)
 	return done
 }

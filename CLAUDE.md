@@ -8,8 +8,9 @@ DynamoDB, so bash history is stored indefinitely and shared across machines.
 - Run tests with `go test -race ./...` (no AWS credentials needed; everything
   is mocked behind small interfaces).
 - `main.go` wires everything together; `file.go` holds the FUSE file state,
-  `writer.go` the async DynamoDB write queue, `content.go` the table scan that
-  materialises the file content.
+  `writer.go` the async DynamoDB write queue, `journal.go` the on-disk copy of
+  lines not yet written, `content.go` the table scan that materialises the
+  file content.
 
 ## Releases
 

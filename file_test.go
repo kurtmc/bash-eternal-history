@@ -90,7 +90,7 @@ func (r *fakeRepo) callCount() int {
 
 func newTestFile(t *testing.T, repo ContentGetter) *File {
 	t.Helper()
-	w := newTestWriter(&fakePutClient{})
+	w := newTestWriter(t, &fakePutClient{})
 	go w.Run()
 	t.Cleanup(func() { w.Shutdown(context.Background()) })
 
@@ -416,25 +416,84 @@ func TestRefreshDisabledByDefault(t *testing.T) {
 	assert.Equal(t, 1, repo.callCount())
 }
 
-func TestRefreshWaitsForPendingWrites(t *testing.T) {
+func TestNoLoadStartsWhileTheWriterIsStalled(t *testing.T) {
 	repo := &fakeRepo{content: "a\n"}
-	w := newTestWriter(&fakePutClient{})
-	// Run() is intentionally not started, so enqueued lines stay pending.
-	f := NewFile(repo, w, time.Millisecond, time.Minute)
+	client := &fakePutClient{}
+	w := newTestWriter(t, client)
+	go w.Run()
+	t.Cleanup(func() { w.Shutdown(context.Background()) })
+	f := NewFile(repo, w, time.Nanosecond, time.Minute)
 	f.loadRetryInterval = 0
+	require.Equal(t, "a\n", readAll(t, f))
 
-	assert.Equal(t, "a\n", readAll(t, f))
+	client.setOffline(true)
 	doWrite(t, f, 2, "echo hi\n")
-	require.Equal(t, int64(1), w.Pending())
-
-	repo.setContent("a\nREMOTE\n")
-	time.Sleep(10 * time.Millisecond)
-	readAll(t, f)
-	time.Sleep(10 * time.Millisecond)
-
-	// No refresh may run while local lines are still unflushed.
+	assert.Eventually(t, w.Stalled, 5*time.Second, time.Millisecond)
+	repo.setContent("a\necho hi\nREMOTE\n")
+	for range 5 {
+		assert.Equal(t, "a\necho hi\n", readAll(t, f))
+	}
 	assert.Equal(t, 1, repo.callCount())
-	assert.NotContains(t, currentData(f), "REMOTE")
+
+	client.setOffline(false)
+	require.Eventually(t, func() bool { return readAll(t, f) == "a\necho hi\nREMOTE\n" }, 5*time.Second, time.Millisecond)
+}
+
+func TestLoadShowsAnUnflushedLineExactlyOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		scanHasIt bool
+	}{
+		{"scan lacks the line", false},
+		{"scan has the line", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &fakeRepo{}
+			// Run is not started, so the line stays unflushed.
+			w := newTestWriter(t, &fakePutClient{})
+			f := NewFile(repo, w, 0, time.Minute)
+			f.loadRetryInterval = 0
+			doWrite(t, f, 0, "echo new\n")
+
+			entries := []historyEntry{{timestamp: 1, content: "old"}}
+			if tc.scanHasIt {
+				entries = append(entries, historyEntry{timestamp: w.Unflushed()[0].Timestamp, content: "echo new"})
+			}
+			repo.setEntries(entries)
+
+			assert.Equal(t, "old\necho new\n", readAll(t, f))
+		})
+	}
+}
+
+func TestReplayedLinesShowBeforeTheFirstLoad(t *testing.T) {
+	dir := t.TempDir()
+	_, ok := openTestWriter(t, &fakePutClient{}, dir).Enqueue("echo replayed\n")
+	require.True(t, ok)
+
+	repo := &fakeRepo{err: errors.New("dynamodb down")}
+	f := NewFile(repo, openTestWriter(t, &fakePutClient{}, dir), 0, time.Minute)
+	f.loadRetryInterval = 0
+	assert.Equal(t, "echo replayed\n", readAll(t, f))
+
+	repo.setError(nil)
+	repo.setContent("old\n")
+	assert.Equal(t, "old\necho replayed\n", readAll(t, f))
+}
+
+func TestWriteFailsWhenTheLineCannotBeKept(t *testing.T) {
+	dir := t.TempDir()
+	w := openTestWriter(t, &fakePutClient{}, dir)
+	go w.Run()
+	f := NewFile(&fakeRepo{content: "a\n"}, w, 0, time.Minute)
+	require.Equal(t, "a\n", readAll(t, f))
+
+	w.Shutdown(context.Background())
+	require.NoError(t, os.RemoveAll(dir))
+	err := f.Write(context.Background(), &fuse.WriteRequest{Data: []byte("echo lost\n")}, &fuse.WriteResponse{})
+
+	require.ErrorIs(t, err, syscall.EIO)
+	assert.Equal(t, "a\n", readAll(t, f))
 }
 
 func TestRefreshMergesWriteThatRacesIt(t *testing.T) {
@@ -505,7 +564,7 @@ func TestWriteAppendsRegardlessOfOffset(t *testing.T) {
 
 func TestWriteEnqueuesEveryLine(t *testing.T) {
 	repo := &fakeRepo{content: ""}
-	w := newTestWriter(&fakePutClient{})
+	w := newTestWriter(t, &fakePutClient{})
 	client := w.svc.(*fakePutClient)
 	go w.Run()
 	t.Cleanup(func() { w.Shutdown(context.Background()) })

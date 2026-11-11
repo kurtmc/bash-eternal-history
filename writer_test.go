@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"os"
 	"strconv"
 	"sync"
 	"testing"
@@ -19,8 +20,10 @@ import (
 type fakePutClient struct {
 	mu     sync.Mutex
 	inputs []*dynamodb.PutItemInput
+	stored []*dynamodb.PutItemInput
 	// errs[i] is returned for call i; a nil or missing entry means success.
-	errs []error
+	errs    []error
+	offline bool
 }
 
 func (f *fakePutClient) PutItem(ctx context.Context, in *dynamodb.PutItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
@@ -28,10 +31,20 @@ func (f *fakePutClient) PutItem(ctx context.Context, in *dynamodb.PutItemInput, 
 	defer f.mu.Unlock()
 	call := len(f.inputs)
 	f.inputs = append(f.inputs, in)
+	if f.offline {
+		return nil, errors.New("dial tcp: network is unreachable")
+	}
 	if call < len(f.errs) && f.errs[call] != nil {
 		return nil, f.errs[call]
 	}
+	f.stored = append(f.stored, in)
 	return &dynamodb.PutItemOutput{}, nil
+}
+
+func (f *fakePutClient) setOffline(offline bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.offline = offline
 }
 
 func (f *fakePutClient) calls() int {
@@ -46,12 +59,51 @@ func (f *fakePutClient) input(i int) *dynamodb.PutItemInput {
 	return f.inputs[i]
 }
 
-func newTestWriter(client *fakePutClient) *HistoryWriter {
-	w := NewHistoryWriter(client, "test")
+func (f *fakePutClient) storedContents() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var contents []string
+	for _, in := range f.stored {
+		contents = append(contents, in.Item["content"].(*types.AttributeValueMemberS).Value)
+	}
+	return contents
+}
+
+type itemKey struct {
+	timestamp, nonce string
+}
+
+func keyOf(in *dynamodb.PutItemInput) itemKey {
+	return itemKey{
+		timestamp: in.Item["timestamp"].(*types.AttributeValueMemberN).Value,
+		nonce:     in.Item["timestamp_2"].(*types.AttributeValueMemberN).Value,
+	}
+}
+
+func newTestWriter(t *testing.T, client *fakePutClient) *HistoryWriter {
+	t.Helper()
+	return openTestWriter(t, client, t.TempDir())
+}
+
+func openTestWriter(t *testing.T, client *fakePutClient, journalDir string) *HistoryWriter {
+	t.Helper()
+	j, err := openJournal(journalDir)
+	require.NoError(t, err)
+	w, err := NewHistoryWriter(client, "test", j)
+	require.NoError(t, err)
 	w.putTimeout = time.Second
 	w.retryDelay = time.Millisecond
 	w.maxAttempts = 5
 	return w
+}
+
+func journaled(t *testing.T, journalDir string) []AppendHistoryMessage {
+	t.Helper()
+	j, err := openJournal(journalDir)
+	require.NoError(t, err)
+	lines, err := j.load()
+	require.NoError(t, err)
+	return lines
 }
 
 func waitForFlush(t *testing.T, w *HistoryWriter) {
@@ -67,7 +119,7 @@ func enqueue(t *testing.T, w *HistoryWriter, content string) bool {
 
 func TestEnqueueReturnsStoredTimestamp(t *testing.T) {
 	client := &fakePutClient{}
-	w := newTestWriter(client)
+	w := newTestWriter(t, client)
 	go w.Run()
 	defer w.Shutdown(context.Background())
 
@@ -81,7 +133,7 @@ func TestEnqueueReturnsStoredTimestamp(t *testing.T) {
 
 func TestWriterWritesItem(t *testing.T) {
 	client := &fakePutClient{}
-	w := newTestWriter(client)
+	w := newTestWriter(t, client)
 	go w.Run()
 	defer w.Shutdown(context.Background())
 
@@ -107,7 +159,7 @@ func TestWriterWritesItem(t *testing.T) {
 
 func TestWriterUsesDistinctRangeKeys(t *testing.T) {
 	client := &fakePutClient{}
-	w := newTestWriter(client)
+	w := newTestWriter(t, client)
 	go w.Run()
 	defer w.Shutdown(context.Background())
 
@@ -131,7 +183,7 @@ func TestWriterUsesDistinctRangeKeys(t *testing.T) {
 
 func TestWriterRetriesUntilSuccess(t *testing.T) {
 	client := &fakePutClient{errs: []error{errors.New("boom"), errors.New("boom")}}
-	w := newTestWriter(client)
+	w := newTestWriter(t, client)
 	go w.Run()
 	defer w.Shutdown(context.Background())
 
@@ -147,7 +199,8 @@ func TestWriterGivesUpAfterRepeatedMalformedRejections(t *testing.T) {
 	// behind it still gets written.
 	rejection := &smithy.GenericAPIError{Code: "ValidationException", Message: "boom"}
 	client := &fakePutClient{errs: []error{rejection, rejection, rejection}}
-	w := newTestWriter(client)
+	dir := t.TempDir()
+	w := openTestWriter(t, client, dir)
 	w.maxAttempts = 3
 	go w.Run()
 	defer w.Shutdown(context.Background())
@@ -159,6 +212,8 @@ func TestWriterGivesUpAfterRepeatedMalformedRejections(t *testing.T) {
 	require.Equal(t, 4, client.calls())
 	content := client.input(3).Item["content"].(*types.AttributeValueMemberS).Value
 	assert.Equal(t, "healthy\n", content)
+	assert.Empty(t, journaled(t, dir), "the dropped line must not be replayed at the next start")
+	assert.False(t, w.Stalled())
 }
 
 func TestWriterRetriesNetworkErrorsIndefinitely(t *testing.T) {
@@ -169,7 +224,7 @@ func TestWriterRetriesNetworkErrorsIndefinitely(t *testing.T) {
 		errs = append(errs, errors.New("dial tcp: network is unreachable"))
 	}
 	client := &fakePutClient{errs: errs}
-	w := newTestWriter(client)
+	w := newTestWriter(t, client)
 	w.maxAttempts = 3
 	go w.Run()
 	defer w.Shutdown(context.Background())
@@ -182,19 +237,27 @@ func TestWriterRetriesNetworkErrorsIndefinitely(t *testing.T) {
 	assert.Equal(t, "echo offline\n", content)
 }
 
-func TestWriterQueueFitsAnOfflineSession(t *testing.T) {
-	w := NewHistoryWriter(&fakePutClient{}, "test")
-	assert.Equal(t, 1000, cap(w.ch))
-}
+func TestWriterAcceptsAnOfflineBacklogOfAnySize(t *testing.T) {
+	client := &fakePutClient{offline: true}
+	w := newTestWriter(t, client)
+	go w.Run()
+	defer w.Shutdown(context.Background())
 
-func TestEnqueueDropsWhenQueueFull(t *testing.T) {
-	w := newTestWriter(&fakePutClient{})
-	w.ch = make(chan AppendHistoryMessage, 1)
-	// Run() is intentionally not started, so the queue cannot drain.
+	var want, accepted []string
+	for i := range 2500 {
+		line := "echo " + strconv.Itoa(i) + "\n"
+		want = append(want, line)
+		if enqueue(t, w, line) {
+			accepted = append(accepted, line)
+		}
+	}
+	assert.Equal(t, want, accepted)
+	assert.Eventually(t, w.Stalled, 5*time.Second, time.Millisecond)
 
-	assert.True(t, enqueue(t, w, "a\n"))
-	assert.False(t, enqueue(t, w, "b\n"))
-	assert.Equal(t, int64(1), w.Pending())
+	client.setOffline(false)
+	waitForFlush(t, w)
+
+	assert.Equal(t, want, client.storedContents())
 }
 
 func TestWriterRetriesTransientErrorsIndefinitely(t *testing.T) {
@@ -204,7 +267,7 @@ func TestWriterRetriesTransientErrorsIndefinitely(t *testing.T) {
 	throttle := &smithy.GenericAPIError{Code: "ThrottlingException", Message: "slow down"}
 	expired := &smithy.GenericAPIError{Code: "ExpiredTokenException", Message: "creds expired"}
 	client := &fakePutClient{errs: []error{throttle, throttle, expired, expired, throttle, expired}}
-	w := newTestWriter(client)
+	w := newTestWriter(t, client)
 	w.maxAttempts = 2
 	go w.Run()
 	defer w.Shutdown(context.Background())
@@ -219,7 +282,7 @@ func TestWriterRetriesTransientErrorsIndefinitely(t *testing.T) {
 
 func TestShutdownDrainsQueuedLines(t *testing.T) {
 	client := &fakePutClient{}
-	w := newTestWriter(client)
+	w := newTestWriter(t, client)
 	go w.Run()
 
 	assert.True(t, enqueue(t, w, "a\n"))
@@ -234,31 +297,79 @@ func TestShutdownDrainsQueuedLines(t *testing.T) {
 	assert.Equal(t, int64(0), w.Pending())
 }
 
-func TestShutdownReportsUnflushedAfterDeadline(t *testing.T) {
+func TestLineUnflushedAtShutdownIsWrittenByTheNextWriter(t *testing.T) {
 	// DynamoDB unreachable at shutdown: the drain cannot complete, so Shutdown
 	// must return once its deadline passes and report the unflushed line rather
 	// than block forever.
-	var errs []error
-	for range 1000 {
-		errs = append(errs, errors.New("dial tcp: network is unreachable"))
-	}
-	client := &fakePutClient{errs: errs}
-	w := newTestWriter(client)
+	dir := t.TempDir()
+	offline := &fakePutClient{offline: true}
+	w := openTestWriter(t, offline, dir)
 	w.retryDelay = 10 * time.Millisecond
 	go w.Run()
 
 	assert.True(t, enqueue(t, w, "echo offline\n"))
+	require.Eventually(t, func() bool { return offline.calls() > 0 }, 5*time.Second, time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	assert.Equal(t, int64(1), w.Shutdown(ctx))
+
+	online := &fakePutClient{}
+	next := openTestWriter(t, online, dir)
+	go next.Run()
+	defer next.Shutdown(context.Background())
+	waitForFlush(t, next)
+
+	require.Equal(t, []string{"echo offline\n"}, online.storedContents())
+	assert.Equal(t, keyOf(offline.input(0)), keyOf(online.input(0)), "the replayed line must overwrite the same item")
+	assert.Empty(t, journaled(t, dir))
 }
 
-func TestEnqueueAfterShutdownIsDropped(t *testing.T) {
-	w := newTestWriter(&fakePutClient{})
+func TestLineJournaledBeforeACrashIsWrittenByTheNextWriter(t *testing.T) {
+	dir := t.TempDir()
+	crashed := openTestWriter(t, &fakePutClient{}, dir)
+	timestamp, ok := crashed.Enqueue("echo crashed\n")
+	require.True(t, ok)
+
+	client := &fakePutClient{}
+	next := openTestWriter(t, client, dir)
+	go next.Run()
+	defer next.Shutdown(context.Background())
+	waitForFlush(t, next)
+
+	require.Equal(t, []string{"echo crashed\n"}, client.storedContents())
+	assert.Equal(t, strconv.FormatInt(timestamp, 10), keyOf(client.input(0)).timestamp)
+	assert.Empty(t, journaled(t, dir))
+}
+
+func TestEnqueueAfterShutdownIsWrittenByTheNextWriter(t *testing.T) {
+	dir := t.TempDir()
+	w := openTestWriter(t, &fakePutClient{}, dir)
 	go w.Run()
 	w.Shutdown(context.Background())
 
-	// Enqueue must not panic on the closed channel; it reports the drop.
+	assert.True(t, enqueue(t, w, "late\n"))
+
+	client := &fakePutClient{}
+	next := openTestWriter(t, client, dir)
+	go next.Run()
+	defer next.Shutdown(context.Background())
+	waitForFlush(t, next)
+
+	assert.Equal(t, []string{"late\n"}, client.storedContents())
+}
+
+func TestEnqueueWithoutAJournalIsRefusedOnlyAfterShutdown(t *testing.T) {
+	dir := t.TempDir()
+	client := &fakePutClient{}
+	w := openTestWriter(t, client, dir)
+	go w.Run()
+	require.NoError(t, os.RemoveAll(dir))
+
+	assert.True(t, enqueue(t, w, "kept in memory\n"))
+	waitForFlush(t, w)
+	assert.Equal(t, []string{"kept in memory\n"}, client.storedContents())
+
+	w.Shutdown(context.Background())
 	assert.False(t, enqueue(t, w, "late\n"))
 }

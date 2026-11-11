@@ -10,7 +10,8 @@ bash which may be appended to by multiple sessions simultaneously.
 > passwords pasted into commands, connection strings). Every line is stored in
 > the DynamoDB table, so anyone with read access to that table can read your
 > history. Scope access to the table tightly and avoid pasting secrets into
-> your shell.
+> your shell. Lines not yet stored in the table are kept as plaintext files
+> (mode 0600) in the journal directory (see `JOURNAL_DIR`).
 
 ## Setup
 
@@ -107,4 +108,5 @@ The daemon is configured through environment variables:
 | `SCAN_SEGMENTS` | `8` | Number of parallel scan segments used to load history. More segments load a large table faster at the cost of more concurrent requests. |
 | `LOAD_WAIT_TIMEOUT` | `30s` | How long a read of the history file waits for the initial load to finish before being served whatever has been written locally so far. Bounds how long a shell opened right after the daemon starts can block; set it above the cold load time so such shells still get the full history. |
 | `CONTENT_CACHE_TTL` | `5m` | How long loaded history is served before it is refreshed in the background, picking up commands written by other machines. Set to `0` to load only once per mount. |
-| `SHUTDOWN_DRAIN_TIMEOUT` | `10s` | How long to keep flushing queued history lines to DynamoDB on shutdown before giving up. |
+| `SHUTDOWN_DRAIN_TIMEOUT` | `10s` | How long to keep flushing queued history lines to DynamoDB on shutdown. Lines still unflushed after it stay in the journal and are written at the next start. |
+| `JOURNAL_DIR` | `$XDG_STATE_HOME/bash-eternal-history/<table name>`, or `~/.local/state/bash-eternal-history/<table name>` when `XDG_STATE_HOME` is unset | Directory holding one file per history line not yet stored in DynamoDB. Lines left there when the daemon stops, crashes, or is killed are written at the next start. |

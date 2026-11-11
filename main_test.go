@@ -131,6 +131,19 @@ func TestEnsureTablePropagatesCreateError(t *testing.T) {
 	assert.ErrorContains(t, err, "limit exceeded")
 }
 
+func TestDefaultJournalDir(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "/state")
+	dir, err := defaultJournalDir("history")
+	require.NoError(t, err)
+	assert.Equal(t, "/state/bash-eternal-history/history", dir)
+
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", "/home/someone")
+	dir, err = defaultJournalDir("history")
+	require.NoError(t, err)
+	assert.Equal(t, "/home/someone/.local/state/bash-eternal-history/history", dir)
+}
+
 var errServe = errors.New("serve failed")
 
 func mustNotBeCalled(t *testing.T, name string) func(string) error {
